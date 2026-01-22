@@ -904,6 +904,7 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
 
             frame_delay = 1.0 / fps
             last_frame_id = None
+            stream_frame_count = 0
 
             try:
                 while running:
@@ -921,6 +922,11 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                         self.wfile.write(b'\r\n')
                         self.wfile.flush()
                         last_frame_id = frame_id
+                        stream_frame_count += 1
+
+                        # Debug: Print every 30 frames sent
+                        if stream_frame_count % 30 == 0:
+                            print(f"[STREAM] Sent frame {stream_frame_count}, id={frame_id}")
 
                     time.sleep(frame_delay)
             except:
@@ -1154,9 +1160,13 @@ def capture_usb():
                 ret, jpeg = cv2.imencode('.jpg', processed_frame, encode_params)
 
             if ret:
+                new_frame = jpeg.tobytes()
                 with frame_lock:
-                    current_frame = jpeg.tobytes()
+                    current_frame = new_frame
                 frame_event.set()
+                # Debug: Print when we update the frame
+                if frame_counter % 30 == 0:
+                    print(f"[FRAME] Updated current_frame, id={id(new_frame)}")
         else:
             time.sleep(0.01)
 
