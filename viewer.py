@@ -903,21 +903,24 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             self.end_headers()
 
             frame_delay = 1.0 / fps
+            last_frame_id = None
 
             try:
                 while running:
                     with frame_lock:
                         frame = current_frame
+                        frame_id = id(current_frame)  # Get unique object ID
 
-                    if frame:
+                    # Send frame if it's new (different object)
+                    if frame and frame_id != last_frame_id:
                         # Write MJPEG frame with proper Content-Length header
-                        # Always send frames, don't compare to last_frame
                         self.wfile.write(b'--frame\r\n')
                         self.wfile.write(b'Content-Type: image/jpeg\r\n')
                         self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
                         self.wfile.flush()
+                        last_frame_id = frame_id
 
                     time.sleep(frame_delay)
             except:
