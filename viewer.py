@@ -1155,10 +1155,15 @@ def capture_usb():
     print(f"Note: libjpeg warnings are harmless and can be ignored\n")
 
     last_capture_time = time.time()
+    frame_counter = 0
+    last_debug_time = time.time()
 
     while running:
-        # Enforce capture FPS limit
+        # Enforce capture FPS limit - read globals directly
+        global capture_fps, jpeg_quality
         current_fps = capture_fps
+        current_quality = jpeg_quality
+
         if current_fps > 0:
             frame_delay = 1.0 / current_fps
             elapsed = time.time() - last_capture_time
@@ -1169,8 +1174,13 @@ def capture_usb():
 
         ret, frame = cap.read()
         if ret:
-            # Get current JPEG quality setting
-            current_quality = jpeg_quality
+            frame_counter += 1
+
+            # Debug every 30 frames
+            if frame_counter % 30 == 0:
+                actual_fps = 30.0 / (time.time() - last_debug_time)
+                last_debug_time = time.time()
+                print(f"[DEBUG] Actual: {actual_fps:.1f} fps | Target: {current_fps} fps | Quality: {current_quality}")
 
             # Fast OpenCV JPEG encoding with adjustable quality
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, current_quality]
