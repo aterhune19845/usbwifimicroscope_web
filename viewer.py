@@ -910,18 +910,28 @@ def capture_usb():
     print(f"Capturing from USB microscope (using {encoding_method} encoding)...")
 
     frame_count = 0
-    last_time = time.time()
+    debug_frame_count = 0
 
     while running:
         ret, frame = cap.read()
         if ret:
+            frame_count += 1
+
+            # Debug: Print frame info every 30 frames
+            if frame_count % 30 == 1:
+                height, width = frame.shape[:2]
+                print(f"\n[DEBUG] Frame #{frame_count}")
+                print(f"  Original dimensions: {width}x{height}")
+                print(f"  Frame dtype: {frame.dtype}, shape: {frame.shape}")
+
             # Ensure frame dimensions are multiples of 16 (JPEG MCU size)
-            # This prevents encoding artifacts and extraneous bytes
             height, width = frame.shape[:2]
             new_height = (height // 16) * 16
             new_width = (width // 16) * 16
 
             if new_height != height or new_width != width:
+                if frame_count % 30 == 1:
+                    print(f"  Resizing to: {new_width}x{new_height}")
                 frame = cv2.resize(frame, (new_width, new_height))
 
             # Use PIL for better JPEG encoding if available, otherwise OpenCV
@@ -936,46 +946,69 @@ def capture_usb():
                     pil_image.save(buffer,
                                  format='JPEG',
                                  quality=85,
-                                 optimize=False,  # Disable optimize to avoid encoding issues
+                                 optimize=False,
                                  progressive=False,
-                                 subsampling='4:2:0')  # Standard JPEG subsampling
+                                 subsampling='4:2:0')
                     jpeg_bytes = buffer.getvalue()
+
+                    # Debug JPEG output
+                    if frame_count % 30 == 1:
+                        print(f"  PIL JPEG size: {len(jpeg_bytes)} bytes")
+                        print(f"  Start marker: {jpeg_bytes[:2].hex()}")
+                        print(f"  End marker: {jpeg_bytes[-2:].hex()}")
+                        # Check for extra bytes after end marker
+                        end_pos = jpeg_bytes.rfind(b'\xff\xd9')
+                        extra_bytes = len(jpeg_bytes) - (end_pos + 2)
+                        print(f"  Bytes after end marker: {extra_bytes}")
 
                     # Validate JPEG structure
                     if len(jpeg_bytes) < 4 or jpeg_bytes[:2] != b'\xff\xd8' or jpeg_bytes[-2:] != b'\xff\xd9':
+                        print(f"[WARNING] Invalid JPEG structure on frame {frame_count}")
                         continue
-                except Exception:
-                    # If PIL fails, skip this frame
+                except Exception as e:
+                    print(f"[ERROR] PIL encoding failed on frame {frame_count}: {e}")
                     continue
             else:
                 # Fallback to OpenCV encoding with baseline settings
                 encode_params = [
                     cv2.IMWRITE_JPEG_QUALITY, 85,
-                    cv2.IMWRITE_JPEG_OPTIMIZE, 0,  # Disable optimization
+                    cv2.IMWRITE_JPEG_OPTIMIZE, 0,
                     cv2.IMWRITE_JPEG_PROGRESSIVE, 0,
                     cv2.IMWRITE_JPEG_LUMA_QUALITY, 85,
                     cv2.IMWRITE_JPEG_CHROMA_QUALITY, 85
                 ]
                 ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
                 if not ret:
+                    print(f"[ERROR] OpenCV encoding failed on frame {frame_count}")
                     continue
                 jpeg_bytes = jpeg.tobytes()
+
+                # Debug JPEG output
+                if frame_count % 30 == 1:
+                    print(f"  OpenCV JPEG size: {len(jpeg_bytes)} bytes")
+                    print(f"  Start marker: {jpeg_bytes[:2].hex()}")
+                    end_pos = jpeg_bytes.rfind(b'\xff\xd9')
+                    print(f"  End marker position: {end_pos} (total: {len(jpeg_bytes)})")
+                    extra_bytes = len(jpeg_bytes) - (end_pos + 2)
+                    print(f"  Bytes after end marker: {extra_bytes}")
 
                 # Strip any extraneous bytes after JPEG end marker (FF D9)
                 end_marker_pos = jpeg_bytes.rfind(b'\xff\xd9')
                 if end_marker_pos == -1:
+                    print(f"[ERROR] No end marker found on frame {frame_count}")
                     continue
                 jpeg_bytes = jpeg_bytes[:end_marker_pos + 2]
 
                 # Validate start marker
                 if len(jpeg_bytes) < 4 or jpeg_bytes[:2] != b'\xff\xd8':
+                    print(f"[ERROR] No start marker found on frame {frame_count}")
                     continue
 
             with frame_lock:
                 current_frame = jpeg_bytes
             frame_event.set()
 
-            # Rate limiting - slower on DietPi to reduce browser JPEG errors
+            # Rate limiting
             time.sleep(0.05)  # ~20 fps max
         else:
             time.sleep(0.01)
