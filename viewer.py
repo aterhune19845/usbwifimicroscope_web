@@ -896,8 +896,14 @@ def capture_usb():
             ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
             if ret:
                 jpeg_bytes = jpeg.tobytes()
-                # Validate JPEG has proper end marker
-                if len(jpeg_bytes) >= 2 and jpeg_bytes[-2:] == b'\xff\xd9':
+
+                # Fix: Strip any extraneous bytes after JPEG end marker (FF D9)
+                # Find the last occurrence of the JPEG end marker
+                end_marker_pos = jpeg_bytes.rfind(b'\xff\xd9')
+                if end_marker_pos != -1:
+                    # Truncate everything after the end marker
+                    jpeg_bytes = jpeg_bytes[:end_marker_pos + 2]
+
                     with frame_lock:
                         current_frame = jpeg_bytes
                     frame_event.set()
