@@ -9,6 +9,8 @@ import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import sys
 import io
+import os
+import warnings
 
 # Try to import PIL for better JPEG encoding
 try:
@@ -37,6 +39,18 @@ frame_event = threading.Event()
 running = True
 target_fps = 29  # Default target FPS for streaming
 connection_mode = None  # Will be 'wifi', 'usb', or None
+
+# Context manager to suppress libjpeg warnings
+class SuppressStderr:
+    def __enter__(self):
+        self.null_fd = os.open(os.devnull, os.O_RDWR)
+        self.save_fd = os.dup(2)
+        os.dup2(self.null_fd, 2)
+
+    def __exit__(self, *_):
+        os.dup2(self.save_fd, 2)
+        os.close(self.null_fd)
+        os.close(self.save_fd)
 
 class MicroscopeHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -901,6 +915,15 @@ def capture_usb():
     while running:
         ret, frame = cap.read()
         if ret:
+            # Ensure frame dimensions are multiples of 16 (JPEG MCU size)
+            # This prevents encoding artifacts and extraneous bytes
+            height, width = frame.shape[:2]
+            new_height = (height // 16) * 16
+            new_width = (width // 16) * 16
+
+            if new_height != height or new_width != width:
+                frame = cv2.resize(frame, (new_width, new_height))
+
             # Use PIL for better JPEG encoding if available, otherwise OpenCV
             if PIL_AVAILABLE:
                 try:
@@ -908,23 +931,30 @@ def capture_usb():
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     # Create PIL Image
                     pil_image = Image.fromarray(frame_rgb)
-                    # Encode to JPEG using PIL with optimal settings
+                    # Encode to JPEG with baseline (non-progressive) and proper subsampling
                     buffer = io.BytesIO()
-                    pil_image.save(buffer, format='JPEG', quality=85, optimize=True, subsampling=0)
+                    pil_image.save(buffer,
+                                 format='JPEG',
+                                 quality=85,
+                                 optimize=False,  # Disable optimize to avoid encoding issues
+                                 progressive=False,
+                                 subsampling='4:2:0')  # Standard JPEG subsampling
                     jpeg_bytes = buffer.getvalue()
 
                     # Validate JPEG structure
                     if len(jpeg_bytes) < 4 or jpeg_bytes[:2] != b'\xff\xd8' or jpeg_bytes[-2:] != b'\xff\xd9':
                         continue
-                except Exception as e:
+                except Exception:
                     # If PIL fails, skip this frame
                     continue
             else:
-                # Fallback to OpenCV encoding
+                # Fallback to OpenCV encoding with baseline settings
                 encode_params = [
                     cv2.IMWRITE_JPEG_QUALITY, 85,
-                    cv2.IMWRITE_JPEG_OPTIMIZE, 1,
-                    cv2.IMWRITE_JPEG_PROGRESSIVE, 0
+                    cv2.IMWRITE_JPEG_OPTIMIZE, 0,  # Disable optimization
+                    cv2.IMWRITE_JPEG_PROGRESSIVE, 0,
+                    cv2.IMWRITE_JPEG_LUMA_QUALITY, 85,
+                    cv2.IMWRITE_JPEG_CHROMA_QUALITY, 85
                 ]
                 ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
                 if not ret:
@@ -945,8 +975,8 @@ def capture_usb():
                 current_frame = jpeg_bytes
             frame_event.set()
 
-            # Rate limiting to prevent overwhelming the browser
-            time.sleep(0.033)  # ~30 fps max
+            # Rate limiting - slower on DietPi to reduce browser JPEG errors
+            time.sleep(0.05)  # ~20 fps max
         else:
             time.sleep(0.01)
 
