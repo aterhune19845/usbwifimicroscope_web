@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Web-based viewer for WiFi/USB microscope
 # Captures images and serves them via HTTP with MJPEG streaming
+# ALL IMAGE PROCESSING DONE IN PYTHON - browser displays raw processed images
 # Supports both WiFi (UDP) and USB (webcam) modes
 
 import time
@@ -40,20 +41,22 @@ running = True
 target_fps = 29  # Default target FPS for streaming
 connection_mode = None  # Will be 'wifi', 'usb', or None
 
-# Camera settings (0-100 scale, will be converted to camera-specific ranges)
-camera_settings = {
-    'brightness': 50,
-    'contrast': 50,
-    'saturation': 50,
-    'sharpness': 50,
-    'exposure': 50
+# Image processing settings (all processing happens in Python)
+processing_settings = {
+    'brightness': 0,     # -100 to 100 (additive)
+    'contrast': 1.0,     # 0.1 to 3.0 (multiplicative)
+    'saturation': 1.0,   # 0.0 to 3.0
+    'flip_h': True,      # Default flipped horizontal
+    'flip_v': True,      # Default flipped vertical
+    'rotate': 0,         # 0, 90, 180, 270
+    'zoom': 1.0          # 0.5 to 4.0
 }
-camera_settings_lock = threading.Lock()
-usb_camera_cap = None  # Global reference to camera for settings adjustment
+processing_lock = threading.Lock()
+usb_camera_cap = None  # Global reference to camera
 
-# Capture settings that affect encoding
+# Capture settings
 capture_fps = 15  # Capture FPS (independent of stream FPS)
-jpeg_quality = 70  # JPEG encoding quality (1-100)
+jpeg_quality = 75  # JPEG encoding quality (1-100)
 capture_settings_lock = threading.Lock()
 
 # Context manager to suppress libjpeg warnings
@@ -67,6 +70,79 @@ class SuppressStderr:
         os.dup2(self.save_fd, 2)
         os.close(self.null_fd)
         os.close(self.save_fd)
+
+def apply_image_processing(frame):
+    """Apply all image processing in Python using OpenCV"""
+    global processing_settings
+
+    with processing_lock:
+        settings = processing_settings.copy()
+
+    # Convert to float for processing
+    processed = frame.astype(np.float32)
+
+    # 1. Apply brightness and contrast
+    # Formula: output = alpha * input + beta
+    # alpha = contrast, beta = brightness
+    if settings['brightness'] != 0 or settings['contrast'] != 1.0:
+        processed = cv2.convertScaleAbs(
+            processed,
+            alpha=settings['contrast'],
+            beta=settings['brightness']
+        )
+        processed = processed.astype(np.float32)
+
+    # 2. Apply saturation
+    if settings['saturation'] != 1.0:
+        # Convert to HSV to adjust saturation
+        hsv = cv2.cvtColor(processed.astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * settings['saturation'], 0, 255)
+        processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
+
+    # Convert back to uint8 for geometric transforms
+    processed = np.clip(processed, 0, 255).astype(np.uint8)
+
+    # 3. Apply flip
+    if settings['flip_h'] and settings['flip_v']:
+        processed = cv2.flip(processed, -1)  # Both axes
+    elif settings['flip_h']:
+        processed = cv2.flip(processed, 1)   # Horizontal
+    elif settings['flip_v']:
+        processed = cv2.flip(processed, 0)   # Vertical
+
+    # 4. Apply rotation
+    rotation = int(settings['rotate']) % 360
+    if rotation == 90:
+        processed = cv2.rotate(processed, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 180:
+        processed = cv2.rotate(processed, cv2.ROTATE_180)
+    elif rotation == 270:
+        processed = cv2.rotate(processed, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    # 5. Apply zoom (center crop and resize)
+    zoom = settings['zoom']
+    if zoom != 1.0:
+        h, w = processed.shape[:2]
+
+        if zoom > 1.0:
+            # Zoom in - crop from center and resize back
+            crop_h = int(h / zoom)
+            crop_w = int(w / zoom)
+            start_y = (h - crop_h) // 2
+            start_x = (w - crop_w) // 2
+            cropped = processed[start_y:start_y+crop_h, start_x:start_x+crop_w]
+            processed = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            # Zoom out - resize smaller and pad with black
+            new_h = int(h * zoom)
+            new_w = int(w * zoom)
+            resized = cv2.resize(processed, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            processed = np.zeros((h, w, 3), dtype=np.uint8)
+            start_y = (h - new_h) // 2
+            start_x = (w - new_w) // 2
+            processed[start_y:start_y+new_h, start_x:start_x+new_w] = resized
+
+    return processed
 
 class MicroscopeHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -100,7 +176,7 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
         .container {
             display: flex;
             height: 100vh;
-            height: 100dvh; /* Dynamic viewport height for mobile */
+            height: 100dvh;
         }
         .sidebar {
             width: 280px;
@@ -285,10 +361,6 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             background: #000;
             display: block;
             image-rendering: auto;
-            will-change: transform;
-            backface-visibility: hidden;
-            -webkit-backface-visibility: hidden;
-            transform-origin: center center;
         }
         .info {
             position: absolute;
@@ -305,17 +377,15 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             font-weight: 600;
         }
 
-        /* Desktop-specific styles */
         @media (min-width: 1025px) {
             .sidebar.mobile-hidden {
-                transform: none; /* Prevent hiding on desktop */
+                transform: none;
             }
             .mobile-overlay {
-                display: none !important; /* Never show overlay on desktop */
+                display: none !important;
             }
         }
 
-        /* Mobile and Tablet Responsive Styles */
         @media (max-width: 1024px) {
             .container {
                 flex-direction: column;
@@ -382,10 +452,9 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             }
         }
 
-        /* Touch-friendly improvements */
         @media (hover: none) and (pointer: coarse) {
             button {
-                min-height: 44px; /* iOS touch target size */
+                min-height: 44px;
             }
 
             input[type="range"] {
@@ -403,13 +472,28 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             <h1>Microscope Controls</h1>
 
             <div class="control-group">
-                <h3>Image Controls</h3>
+                <h3>Image Processing</h3>
+                <div class="slider-control">
+                    <label>Brightness: <span class="slider-value" id="brightness-value">0</span></label>
+                    <input type="range" id="brightness-slider" min="-100" max="100" value="0" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>Contrast: <span class="slider-value" id="contrast-value">1.0</span></label>
+                    <input type="range" id="contrast-slider" min="10" max="300" value="100" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>Saturation: <span class="slider-value" id="saturation-value">1.0</span></label>
+                    <input type="range" id="saturation-slider" min="0" max="300" value="100" step="1">
+                </div>
+            </div>
+
+            <div class="control-group">
+                <h3>Orientation</h3>
                 <div class="button-group">
                     <button onclick="flipHorizontal()">Flip H</button>
                     <button onclick="flipVertical()">Flip V</button>
                     <button onclick="rotateLeft()">↶ 90°</button>
                     <button onclick="rotateRight()">↷ 90°</button>
-                    <button onclick="resetTransform()">Reset</button>
                 </div>
             </div>
 
@@ -432,8 +516,8 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     <input type="range" id="capture-fps-slider" min="1" max="30" value="15" step="1">
                 </div>
                 <div class="slider-control">
-                    <label>JPEG Quality: <span class="slider-value" id="quality-value">70</span></label>
-                    <input type="range" id="quality-slider" min="10" max="100" value="70" step="5">
+                    <label>JPEG Quality: <span class="slider-value" id="quality-value">75</span></label>
+                    <input type="range" id="quality-slider" min="10" max="100" value="75" step="5">
                 </div>
                 <div class="slider-control">
                     <label>Stream FPS: <span class="slider-value" id="fps-value">29</span></label>
@@ -442,28 +526,8 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             </div>
 
             <div class="control-group">
-                <h3>Camera Settings</h3>
-                <div class="slider-control">
-                    <label>Brightness: <span class="slider-value" id="brightness-value">50</span></label>
-                    <input type="range" id="brightness-slider" min="0" max="100" value="50" step="1">
-                </div>
-                <div class="slider-control">
-                    <label>Contrast: <span class="slider-value" id="contrast-value">50</span></label>
-                    <input type="range" id="contrast-slider" min="0" max="100" value="50" step="1">
-                </div>
-                <div class="slider-control">
-                    <label>Saturation: <span class="slider-value" id="saturation-value">50</span></label>
-                    <input type="range" id="saturation-slider" min="0" max="100" value="50" step="1">
-                </div>
-                <div class="slider-control">
-                    <label>Sharpness: <span class="slider-value" id="sharpness-value">50</span></label>
-                    <input type="range" id="sharpness-slider" min="0" max="100" value="50" step="1">
-                </div>
-                <div class="slider-control">
-                    <label>Exposure: <span class="slider-value" id="exposure-value">50</span></label>
-                    <input type="range" id="exposure-slider" min="0" max="100" value="50" step="1">
-                </div>
-                <button onclick="resetCameraSettings()">Reset Camera Settings</button>
+                <h3>Reset</h3>
+                <button class="primary" onclick="resetAll()">Reset All Settings</button>
             </div>
 
             <div class="control-group">
@@ -482,7 +546,7 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     <img id="microscope-image" src="/stream.mjpg" alt="Microscope feed">
                 </div>
                 <div class="info">
-                    Using MJPEG stream • <span class="fps" id="actual-fps">-- FPS</span>
+                    Processed in Python • <span class="fps" id="actual-fps">-- FPS</span>
                 </div>
             </div>
         </div>
@@ -499,13 +563,6 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
         const mobileToggle = document.getElementById('mobile-toggle');
         const mobileOverlay = document.getElementById('mobile-overlay');
 
-        let transform = {
-            scaleX: -1,  // Default flipped horizontal
-            scaleY: -1,  // Default flipped vertical
-            rotate: 0,
-            zoom: 1
-        };
-
         let frameCount = 0;
         let lastFpsUpdate = Date.now();
 
@@ -514,7 +571,6 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             const isHidden = sidebar.classList.toggle('mobile-hidden');
             if (window.innerWidth <= 1024) {
                 mobileOverlay.style.display = isHidden ? 'none' : 'block';
-                // Trigger reflow for transition
                 setTimeout(() => {
                     mobileOverlay.classList.toggle('active', !isHidden);
                 }, 10);
@@ -529,25 +585,20 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             }, 300);
         }
 
-        // Handle initial sidebar state and window resize
         function handleResize() {
             if (window.innerWidth <= 1024) {
-                // Mobile/tablet - start with sidebar hidden
                 if (!sidebar.classList.contains('mobile-hidden')) {
                     closeSidebar();
                 }
             } else {
-                // Desktop - ensure sidebar is visible and overlay is hidden
                 sidebar.classList.remove('mobile-hidden');
                 mobileOverlay.style.display = 'none';
                 mobileOverlay.classList.remove('active');
             }
         }
 
-        // Set initial state
         handleResize();
 
-        // Handle window resize
         let resizeTimeout;
         window.addEventListener('resize', function() {
             clearTimeout(resizeTimeout);
@@ -565,42 +616,67 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             }
         });
 
-        function updateTransform() {
-            const transforms = [];
-            transforms.push(`scale(${transform.scaleX * transform.zoom}, ${transform.scaleY * transform.zoom})`);
-            transforms.push(`rotate(${transform.rotate}deg)`);
-            img.style.transform = transforms.join(' ');
-        }
+        // Brightness slider
+        const brightnessSlider = document.getElementById('brightness-slider');
+        const brightnessValue = document.getElementById('brightness-value');
+        brightnessSlider.addEventListener('input', function() {
+            const value = this.value;
+            brightnessValue.textContent = value;
+            fetch(`/process/brightness/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set brightness:', err));
+        });
 
-        // Apply default transform on load
-        updateTransform();
+        // Contrast slider (display as 0.1-3.0, send as 10-300)
+        const contrastSlider = document.getElementById('contrast-slider');
+        const contrastValue = document.getElementById('contrast-value');
+        contrastSlider.addEventListener('input', function() {
+            const value = this.value;
+            const displayValue = (value / 100).toFixed(1);
+            contrastValue.textContent = displayValue;
+            fetch(`/process/contrast/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set contrast:', err));
+        });
 
+        // Saturation slider (display as 0.0-3.0, send as 0-300)
+        const saturationSlider = document.getElementById('saturation-slider');
+        const saturationValue = document.getElementById('saturation-value');
+        saturationSlider.addEventListener('input', function() {
+            const value = this.value;
+            const displayValue = (value / 100).toFixed(1);
+            saturationValue.textContent = displayValue;
+            fetch(`/process/saturation/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set saturation:', err));
+        });
+
+        // Flip controls
         function flipHorizontal() {
-            transform.scaleX *= -1;
-            updateTransform();
+            fetch('/process/flip_h/toggle', { method: 'POST' })
+                .catch(err => console.error('Failed to flip horizontal:', err));
         }
 
         function flipVertical() {
-            transform.scaleY *= -1;
-            updateTransform();
+            fetch('/process/flip_v/toggle', { method: 'POST' })
+                .catch(err => console.error('Failed to flip vertical:', err));
         }
 
+        // Rotation controls
         function rotateLeft() {
-            transform.rotate -= 90;
-            updateTransform();
+            fetch('/process/rotate/-90', { method: 'POST' })
+                .catch(err => console.error('Failed to rotate:', err));
         }
 
         function rotateRight() {
-            transform.rotate += 90;
-            updateTransform();
+            fetch('/process/rotate/90', { method: 'POST' })
+                .catch(err => console.error('Failed to rotate:', err));
         }
 
-        function resetTransform() {
-            transform.scaleX = 1;
-            transform.scaleY = 1;
-            transform.rotate = 0;
-            updateTransform();
-        }
+        // Zoom controls
+        zoomSlider.addEventListener('input', function() {
+            const value = this.value;
+            zoomValue.textContent = value + '%';
+            fetch(`/process/zoom/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set zoom:', err));
+        });
 
         function zoomIn() {
             const currentZoom = parseInt(zoomSlider.value);
@@ -613,20 +689,6 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             zoomSlider.value = Math.max(50, currentZoom - 25);
             zoomSlider.dispatchEvent(new Event('input'));
         }
-
-        zoomSlider.addEventListener('input', function() {
-            const value = this.value;
-            zoomValue.textContent = value + '%';
-            transform.zoom = value / 100;
-            updateTransform();
-        });
-
-        fpsSlider.addEventListener('input', function() {
-            const value = this.value;
-            fpsValue.textContent = value;
-            // Reconnect stream with new FPS
-            img.src = '/stream.mjpg?fps=' + value + '&t=' + Date.now();
-        });
 
         // Capture FPS slider
         const captureFpsSlider = document.getElementById('capture-fps-slider');
@@ -648,61 +710,43 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                 .catch(err => console.error('Failed to set JPEG quality:', err));
         });
 
-        // Camera settings sliders
-        const cameraSettings = ['brightness', 'contrast', 'saturation', 'sharpness', 'exposure'];
-        cameraSettings.forEach(setting => {
-            const slider = document.getElementById(`${setting}-slider`);
-            const valueDisplay = document.getElementById(`${setting}-value`);
-
-            slider.addEventListener('input', function() {
-                const value = this.value;
-                valueDisplay.textContent = value;
-
-                // Send camera setting to server
-                fetch(`/camera/${setting}/${value}`, { method: 'POST' })
-                    .catch(err => console.error(`Failed to set ${setting}:`, err));
-            });
+        // Stream FPS slider
+        fpsSlider.addEventListener('input', function() {
+            const value = this.value;
+            fpsValue.textContent = value;
+            img.src = '/stream.mjpg?fps=' + value + '&t=' + Date.now();
         });
 
-        function resetCameraSettings() {
-            cameraSettings.forEach(setting => {
-                const slider = document.getElementById(`${setting}-slider`);
-                const valueDisplay = document.getElementById(`${setting}-value`);
-                slider.value = 50;
-                valueDisplay.textContent = '50';
+        // Reset all settings
+        function resetAll() {
+            // Reset sliders to defaults
+            brightnessSlider.value = 0;
+            brightnessValue.textContent = '0';
+            contrastSlider.value = 100;
+            contrastValue.textContent = '1.0';
+            saturationSlider.value = 100;
+            saturationValue.textContent = '1.0';
+            zoomSlider.value = 100;
+            zoomValue.textContent = '100%';
 
-                fetch(`/camera/${setting}/50`, { method: 'POST' })
-                    .catch(err => console.error(`Failed to reset ${setting}:`, err));
-            });
+            fetch('/process/reset', { method: 'POST' })
+                .catch(err => console.error('Failed to reset:', err));
         }
 
         function takeScreenshot() {
-            // Create a canvas to capture the current frame
-            const canvas = document.createElement('canvas');
-            const ctx = canvas.getContext('2d');
-
-            // Set canvas size to match image natural size
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
-
-            // Apply transforms to canvas
-            ctx.save();
-            ctx.translate(canvas.width / 2, canvas.height / 2);
-            ctx.scale(transform.scaleX, transform.scaleY);
-            ctx.rotate(transform.rotate * Math.PI / 180);
-            ctx.drawImage(img, -canvas.width / 2, -canvas.height / 2);
-            ctx.restore();
-
-            // Download the image
-            canvas.toBlob(function(blob) {
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-                a.download = `microscope_${timestamp}.jpg`;
-                a.click();
-                URL.revokeObjectURL(url);
-            }, 'image/jpeg', 0.95);
+            // Fetch current processed frame from server
+            fetch('/current.jpg')
+                .then(response => response.blob())
+                .then(blob => {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+                    a.download = `microscope_${timestamp}.jpg`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                })
+                .catch(err => console.error('Failed to take screenshot:', err));
         }
 
         // Video recording functionality
@@ -721,41 +765,30 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
 
         async function startRecording() {
             try {
-                // Create a canvas to capture the stream with transforms
                 const canvas = document.createElement('canvas');
                 const ctx = canvas.getContext('2d');
 
-                // Set canvas size to match image
                 canvas.width = img.naturalWidth;
                 canvas.height = img.naturalHeight;
 
-                // Capture stream from canvas
-                const stream = canvas.captureStream(29); // 29 fps
+                const stream = canvas.captureStream(29);
 
-                // Draw frames to canvas continuously
                 let animationId;
                 function drawFrame() {
-                    ctx.save();
                     ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    ctx.translate(canvas.width / 2, canvas.height / 2);
-                    ctx.scale(transform.scaleX, transform.scaleY);
-                    ctx.rotate(transform.rotate * Math.PI / 180);
-                    ctx.drawImage(img, -canvas.width / 2, -canvas.height / 2);
-                    ctx.restore();
+                    ctx.drawImage(img, 0, 0);
 
                     if (mediaRecorder && mediaRecorder.state === 'recording') {
                         animationId = requestAnimationFrame(drawFrame);
                     }
                 }
 
-                // Set up media recorder
                 recordedChunks = [];
                 const options = {
                     mimeType: 'video/webm;codecs=vp9',
-                    videoBitsPerSecond: 8000000 // 8 Mbps for high quality
+                    videoBitsPerSecond: 8000000
                 };
 
-                // Fallback for browsers that don't support vp9
                 if (!MediaRecorder.isTypeSupported(options.mimeType)) {
                     options.mimeType = 'video/webm;codecs=vp8';
                 }
@@ -781,14 +814,12 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     cancelAnimationFrame(animationId);
                 };
 
-                mediaRecorder.start(1000); // Collect data every second
+                mediaRecorder.start(1000);
                 drawFrame();
 
-                // Update UI
                 document.getElementById('record-btn').textContent = '⏹ Stop Recording';
                 document.getElementById('recording-status').style.display = 'block';
 
-                // Start timer
                 recordingStartTime = Date.now();
                 recordingInterval = setInterval(updateRecordingTime, 1000);
 
@@ -802,11 +833,9 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             if (mediaRecorder && mediaRecorder.state === 'recording') {
                 mediaRecorder.stop();
 
-                // Update UI
                 document.getElementById('record-btn').textContent = '⏺ Start Recording';
                 document.getElementById('recording-status').style.display = 'none';
 
-                // Stop timer
                 if (recordingInterval) {
                     clearInterval(recordingInterval);
                     recordingInterval = null;
@@ -832,7 +861,7 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                 if (e.ctrlKey || e.metaKey) {
                     toggleRecording();
                 } else {
-                    resetTransform();
+                    resetAll();
                 }
             } else if (e.key === 'h' || e.key === 'H') {
                 flipHorizontal();
@@ -843,67 +872,6 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             } else if (e.key === '-' || e.key === '_') {
                 zoomOut();
             }
-        });
-
-        // Touch gesture controls for mobile
-        let touchStartDistance = 0;
-        let touchStartZoom = 1;
-        let lastTap = 0;
-
-        img.addEventListener('touchstart', function(e) {
-            if (e.touches.length === 2) {
-                // Pinch to zoom
-                e.preventDefault();
-                const touch1 = e.touches[0];
-                const touch2 = e.touches[1];
-                touchStartDistance = Math.hypot(
-                    touch2.clientX - touch1.clientX,
-                    touch2.clientY - touch1.clientY
-                );
-                touchStartZoom = transform.zoom;
-            } else if (e.touches.length === 1) {
-                // Double tap to reset zoom
-                const currentTime = new Date().getTime();
-                const tapLength = currentTime - lastTap;
-                if (tapLength < 300 && tapLength > 0) {
-                    e.preventDefault();
-                    resetTransform();
-                }
-                lastTap = currentTime;
-            }
-        }, { passive: false });
-
-        img.addEventListener('touchmove', function(e) {
-            if (e.touches.length === 2) {
-                e.preventDefault();
-                const touch1 = e.touches[0];
-                const touch2 = e.touches[1];
-                const touchDistance = Math.hypot(
-                    touch2.clientX - touch1.clientX,
-                    touch2.clientY - touch1.clientY
-                );
-
-                const scale = touchDistance / touchStartDistance;
-                const newZoom = Math.max(0.5, Math.min(4, touchStartZoom * scale));
-
-                transform.zoom = newZoom;
-                zoomSlider.value = newZoom * 100;
-                zoomValue.textContent = Math.round(newZoom * 100) + '%';
-                updateTransform();
-            }
-        }, { passive: false });
-
-        // Prevent default zoom behavior on iOS
-        document.addEventListener('gesturestart', function(e) {
-            e.preventDefault();
-        });
-
-        document.addEventListener('gesturechange', function(e) {
-            e.preventDefault();
-        });
-
-        document.addEventListener('gestureend', function(e) {
-            e.preventDefault();
         });
     </script>
 </body>
@@ -919,7 +887,7 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     if param.startswith('fps='):
                         try:
                             fps = int(param.split('=')[1])
-                            fps = max(1, min(29, fps))  # Clamp between 1-29
+                            fps = max(1, min(29, fps))
                         except:
                             pass
 
@@ -946,7 +914,7 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                         self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
-                        self.wfile.flush()  # Force flush to prevent buffering issues
+                        self.wfile.flush()
                         last_frame = frame
 
                     time.sleep(frame_delay)
@@ -972,33 +940,92 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        global camera_settings, usb_camera_cap, capture_fps, jpeg_quality
+        global processing_settings, capture_fps, jpeg_quality
 
-        # Handle camera settings API
-        if self.path.startswith('/camera/'):
+        # Handle image processing settings
+        if self.path.startswith('/process/'):
             parts = self.path.split('/')
-            if len(parts) == 4:
+
+            if parts[2] == 'reset':
+                # Reset all processing settings to defaults
+                with processing_lock:
+                    processing_settings['brightness'] = 0
+                    processing_settings['contrast'] = 1.0
+                    processing_settings['saturation'] = 1.0
+                    processing_settings['flip_h'] = True
+                    processing_settings['flip_v'] = True
+                    processing_settings['rotate'] = 0
+                    processing_settings['zoom'] = 1.0
+                print("[PROCESS] Reset all settings to defaults")
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status": "ok"}')
+                return
+
+            elif len(parts) == 4:
                 setting = parts[2]
+                value_str = parts[3]
+
                 try:
-                    value = int(parts[3])
-                    if setting in camera_settings and 0 <= value <= 100:
-                        with camera_settings_lock:
-                            camera_settings[setting] = value
+                    if setting == 'brightness':
+                        value = int(value_str)
+                        with processing_lock:
+                            processing_settings['brightness'] = value
+                        print(f"[PROCESS] Brightness: {value}")
 
-                        # Apply setting to USB camera if available
-                        if usb_camera_cap and connection_mode == 'usb':
-                            apply_camera_setting(usb_camera_cap, setting, value)
+                    elif setting == 'contrast':
+                        value = int(value_str) / 100.0  # Convert 10-300 to 0.1-3.0
+                        with processing_lock:
+                            processing_settings['contrast'] = value
+                        print(f"[PROCESS] Contrast: {value:.2f}")
 
-                        self.send_response(200)
-                        self.send_header('Content-type', 'application/json')
+                    elif setting == 'saturation':
+                        value = int(value_str) / 100.0  # Convert 0-300 to 0.0-3.0
+                        with processing_lock:
+                            processing_settings['saturation'] = value
+                        print(f"[PROCESS] Saturation: {value:.2f}")
+
+                    elif setting == 'flip_h' and value_str == 'toggle':
+                        with processing_lock:
+                            processing_settings['flip_h'] = not processing_settings['flip_h']
+                            new_state = processing_settings['flip_h']
+                        print(f"[PROCESS] Flip H: {new_state}")
+
+                    elif setting == 'flip_v' and value_str == 'toggle':
+                        with processing_lock:
+                            processing_settings['flip_v'] = not processing_settings['flip_v']
+                            new_state = processing_settings['flip_v']
+                        print(f"[PROCESS] Flip V: {new_state}")
+
+                    elif setting == 'rotate':
+                        delta = int(value_str)
+                        with processing_lock:
+                            processing_settings['rotate'] = (processing_settings['rotate'] + delta) % 360
+                            new_rotation = processing_settings['rotate']
+                        print(f"[PROCESS] Rotation: {new_rotation}°")
+
+                    elif setting == 'zoom':
+                        value = int(value_str) / 100.0  # Convert 50-400 to 0.5-4.0
+                        with processing_lock:
+                            processing_settings['zoom'] = value
+                        print(f"[PROCESS] Zoom: {value:.2f}x")
+
+                    else:
+                        self.send_response(400)
                         self.end_headers()
-                        self.wfile.write(b'{"status": "ok"}')
                         return
-                except:
-                    pass
 
-            self.send_response(400)
-            self.end_headers()
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "ok"}')
+                    return
+                except Exception as e:
+                    print(f"[PROCESS] Error: {e}")
+                    self.send_response(400)
+                    self.end_headers()
+                    return
 
         # Handle capture settings API
         elif self.path.startswith('/capture/'):
@@ -1012,13 +1039,6 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                         global capture_fps
                         capture_fps = value
                         print(f"[CAPTURE] Capture FPS set to: {value}")
-
-                        # Also update camera FPS if USB
-                        if usb_camera_cap and connection_mode == 'usb':
-                            old_fps = usb_camera_cap.get(cv2.CAP_PROP_FPS)
-                            usb_camera_cap.set(cv2.CAP_PROP_FPS, value)
-                            new_fps = usb_camera_cap.get(cv2.CAP_PROP_FPS)
-                            print(f"[CAPTURE] Camera FPS: {old_fps:.1f} -> {new_fps:.1f} (requested: {value})")
 
                         self.send_response(200)
                         self.send_header('Content-type', 'application/json')
@@ -1050,64 +1070,9 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
         # Suppress logging
         pass
 
-def apply_camera_setting(cap, setting, value):
-    """Apply camera setting to USB camera (value is 0-100)"""
-    # Map setting names to OpenCV properties
-    property_map = {
-        'brightness': cv2.CAP_PROP_BRIGHTNESS,
-        'contrast': cv2.CAP_PROP_CONTRAST,
-        'saturation': cv2.CAP_PROP_SATURATION,
-        'sharpness': cv2.CAP_PROP_SHARPNESS,
-        'exposure': cv2.CAP_PROP_EXPOSURE
-    }
-
-    if setting not in property_map:
-        return
-
-    prop = property_map[setting]
-
-    # Get current value and range to understand what camera supports
-    old_value = cap.get(prop)
-
-    # Different cameras use different ranges - try multiple approaches
-    success = False
-
-    try:
-        if setting == 'exposure':
-            # Exposure is tricky - try disabling auto exposure first
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual mode
-            # Try absolute value range (camera dependent, usually -13 to -1 for webcams)
-            exposure_value = -13 + (value / 100.0) * 12  # Maps 0-100 to -13 to -1
-            cap.set(prop, exposure_value)
-            new_value = cap.get(prop)
-            print(f"[CAMERA] {setting}: {old_value:.2f} -> {new_value:.2f} (target: {exposure_value:.2f})")
-            success = (new_value != old_value)
-        else:
-            # Try multiple value ranges to see what works
-            attempts = [
-                value / 100.0,           # 0.0 - 1.0
-                value,                    # 0 - 100
-                (value - 50) / 50.0,     # -1.0 to 1.0
-                value / 255.0 * 100,     # 0 - 100 (some cameras)
-            ]
-
-            for attempt_value in attempts:
-                cap.set(prop, attempt_value)
-                new_value = cap.get(prop)
-                if new_value != old_value:
-                    print(f"[CAMERA] {setting}: {old_value:.2f} -> {new_value:.2f} (input: {value})")
-                    success = True
-                    break
-
-        if not success:
-            print(f"[CAMERA] {setting}: No change (camera may not support this property)")
-
-    except Exception as e:
-        print(f"[CAMERA] Error setting {setting}: {e}")
-
 def capture_usb():
-    """Capture frames from USB microscope"""
-    global current_frame, running, connection_mode, usb_camera_cap, camera_settings
+    """Capture frames from USB microscope and apply processing"""
+    global current_frame, running, connection_mode, usb_camera_cap
 
     if not USB_AVAILABLE:
         print("ERROR: OpenCV not available for USB capture")
@@ -1117,7 +1082,7 @@ def capture_usb():
 
     # Try to open the USB camera
     cap = None
-    for device_id in range(5):  # Try first 5 camera devices
+    for device_id in range(5):
         cap = cv2.VideoCapture(device_id)
         if cap.isOpened():
             print(f"Found USB microscope on device {device_id}")
@@ -1130,36 +1095,23 @@ def capture_usb():
         print("No USB microscope found")
         return
 
-    # Set global reference for settings adjustment
     usb_camera_cap = cap
 
     # Set camera properties optimized for Raspberry Pi 3
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 15)  # Lower FPS for Pi 3 performance
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer to reduce lag
+    cap.set(cv2.CAP_PROP_FPS, 15)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    # Try to get MJPEG directly from camera (skips encoding if camera supports it)
-    try:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    except:
-        pass
-
-    # Apply initial camera settings
-    with camera_settings_lock:
-        for setting, value in camera_settings.items():
-            apply_camera_setting(cap, setting, value)
-
-    print(f"Capturing from USB microscope (optimized for Raspberry Pi 3)...")
-    print(f"Camera controls available in web interface")
-    print(f"Note: libjpeg warnings are harmless and can be ignored\n")
+    print(f"Capturing from USB microscope...")
+    print(f"All image processing done in Python - sliders affect image in real-time\n")
 
     last_capture_time = time.time()
     frame_counter = 0
     last_debug_time = time.time()
 
     while running:
-        # Enforce capture FPS limit - read globals directly
+        # Read capture settings
         global capture_fps, jpeg_quality
         current_fps = capture_fps
         current_quality = jpeg_quality
@@ -1180,13 +1132,18 @@ def capture_usb():
             if frame_counter % 30 == 0:
                 actual_fps = 30.0 / (time.time() - last_debug_time)
                 last_debug_time = time.time()
-                print(f"[DEBUG] Actual: {actual_fps:.1f} fps | Target: {current_fps} fps | Quality: {current_quality}")
+                with processing_lock:
+                    settings_str = f"B:{processing_settings['brightness']} C:{processing_settings['contrast']:.1f} S:{processing_settings['saturation']:.1f} Z:{processing_settings['zoom']:.1f}x"
+                print(f"[DEBUG] {actual_fps:.1f} fps | {settings_str}")
 
-            # Fast OpenCV JPEG encoding with adjustable quality
+            # Apply all image processing in Python
+            processed_frame = apply_image_processing(frame)
+
+            # Encode to JPEG
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, current_quality]
 
-            with SuppressStderr():  # Suppress libjpeg warnings
-                ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
+            with SuppressStderr():
+                ret, jpeg = cv2.imencode('.jpg', processed_frame, encode_params)
 
             if ret:
                 with frame_lock:
@@ -1199,7 +1156,7 @@ def capture_usb():
     print("USB capture stopped")
 
 def capture_wifi():
-    """Capture frames from WiFi microscope"""
+    """Capture frames from WiFi microscope and apply processing"""
     global current_frame, running, connection_mode
 
     print(f"Attempting to connect to WiFi microscope at {HOST}...")
@@ -1208,10 +1165,8 @@ def capture_wifi():
         # Open command socket for sending
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(2)
-            # Send commands like naInit_Re() would do
             s.sendto(b"JHCMD\x10\x00", (HOST, SPORT))
             s.sendto(b"JHCMD\x20\x00", (HOST, SPORT))
-            # Heartbeat command, starts the transmission of data from the scope
             s.sendto(b"JHCMD\xd0\x01", (HOST, SPORT))
             s.sendto(b"JHCMD\xd0\x01", (HOST, SPORT))
 
@@ -1226,45 +1181,69 @@ def capture_wifi():
 
                 connection_mode = 'wifi'
                 print("Connected to WiFi microscope, receiving data...")
+                print("All image processing done in Python - sliders affect image in real-time\n")
+
+                frame_counter = 0
+                last_debug_time = time.time()
 
                 while running:
                     try:
                         data = r.recv(1450)
                         if len(data) > 8:
-                            # Header
                             framecount = data[0] + data[1]*256
                             packetcount = data[3]
 
-                            # Data
                             if packetcount == 0:
-                                # New frame started - validate and save previous frame
+                                # New frame - process and save previous
                                 if frame_buffer and last_framecount != framecount:
-                                    # Validate JPEG: check for proper start (FF D8) and end (FF D9) markers
                                     if len(frame_buffer) >= 4 and frame_buffer[0:2] == b'\xff\xd8':
-                                        # Check for end marker in last few bytes
                                         if frame_buffer[-2:] == b'\xff\xd9':
-                                            with frame_lock:
-                                                current_frame = bytes(frame_buffer)
-                                            frame_event.set()
+                                            # Decode JPEG to apply processing
+                                            if USB_AVAILABLE:
+                                                nparr = np.frombuffer(frame_buffer, np.uint8)
+                                                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-                                # Reset buffer for new frame
+                                                if frame is not None:
+                                                    frame_counter += 1
+
+                                                    # Debug every 30 frames
+                                                    if frame_counter % 30 == 0:
+                                                        actual_fps = 30.0 / (time.time() - last_debug_time)
+                                                        last_debug_time = time.time()
+                                                        with processing_lock:
+                                                            settings_str = f"B:{processing_settings['brightness']} C:{processing_settings['contrast']:.1f} S:{processing_settings['saturation']:.1f} Z:{processing_settings['zoom']:.1f}x"
+                                                        print(f"[DEBUG] {actual_fps:.1f} fps | {settings_str}")
+
+                                                    # Apply processing
+                                                    processed_frame = apply_image_processing(frame)
+
+                                                    # Re-encode
+                                                    encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+                                                    with SuppressStderr():
+                                                        ret, jpeg = cv2.imencode('.jpg', processed_frame, encode_params)
+
+                                                    if ret:
+                                                        with frame_lock:
+                                                            current_frame = jpeg.tobytes()
+                                                        frame_event.set()
+                                            else:
+                                                # No OpenCV - just pass through raw frames
+                                                with frame_lock:
+                                                    current_frame = bytes(frame_buffer)
+                                                frame_event.set()
+
                                 frame_buffer = bytearray()
                                 last_framecount = framecount
-
-                                # First packet has extra 16-byte header, skip 24 bytes total
                                 frame_buffer.extend(data[24:])
 
-                                # Send heartbeat every 50 frames
                                 heartbeat_counter += 1
                                 if heartbeat_counter % 50 == 0:
                                     s.sendto(b"JHCMD\xd0\x01", (HOST, SPORT))
                             else:
-                                # Subsequent packets only have standard 8-byte header
                                 frame_buffer.extend(data[8:])
                     except:
                         time.sleep(0.001)
 
-            # Stop data command
             s.sendto(b"JHCMD\xd0\x02", (HOST, SPORT))
             print("WiFi capture stopped")
     except Exception as e:
@@ -1274,15 +1253,13 @@ def capture_microscope():
     """Capture frames from microscope - tries WiFi first, then USB"""
     global connection_mode, current_frame
 
-    # Try WiFi first
     print("\n" + "="*50)
     print("Detecting microscope connection...")
     print("="*50)
 
-    # Check if WiFi microscope is reachable by trying to get actual data
+    # Check WiFi first
     wifi_available = False
     try:
-        # Send init commands
         test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         test_sock.settimeout(0.5)
         test_sock.sendto(b"JHCMD\x10\x00", (HOST, SPORT))
@@ -1290,12 +1267,10 @@ def capture_microscope():
         test_sock.sendto(b"JHCMD\xd0\x01", (HOST, SPORT))
         test_sock.close()
 
-        # Try to receive data on the receive port
         recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         recv_sock.settimeout(2)
         recv_sock.bind(("", RPORT))
 
-        # Wait for actual data
         data = recv_sock.recv(1450)
         if len(data) > 8:
             wifi_available = True
@@ -1318,7 +1293,10 @@ def main():
     global running, connection_mode
 
     print("="*50)
-    print("Microscope Web Viewer (WiFi/USB)")
+    print("Microscope Web Viewer (Python Image Processing)")
+    print("="*50)
+    print("All image processing happens in Python")
+    print("Sliders affect the image in real-time")
     print("="*50)
 
     # Start microscope capture in a separate thread
@@ -1343,7 +1321,7 @@ def main():
     print("  Ctrl+R - Start/Stop recording")
     print("  H - Flip horizontal")
     print("  V - Flip vertical")
-    print("  R - Reset transform")
+    print("  R - Reset all settings")
     print("  +/- - Zoom in/out\n")
 
     try:
