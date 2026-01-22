@@ -7,11 +7,12 @@
 import time
 import socket
 import threading
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import sys
 import io
 import os
 import warnings
+from datetime import datetime
 
 # Try to import PIL for better JPEG encoding
 try:
@@ -35,6 +36,7 @@ RPORT = 10900          # Receive port for JPEG frames
 WEB_PORT = 8080        # Web server port
 
 current_frame = None
+current_frame_number = 0  # Increments with each new frame
 frame_lock = threading.Lock()
 frame_event = threading.Event()
 running = True
@@ -612,6 +614,13 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
         img.addEventListener('load', function() {
             frameCount++;
             const now = Date.now();
+
+            // Debug every 30 frames
+            if (frameCount % 30 === 0) {
+                const timestamp = new Date().toISOString();
+                console.log(`[${timestamp}] BROWSER: Received and displayed frame ${frameCount}`);
+            }
+
             if (now - lastFpsUpdate >= 1000) {
                 actualFpsDisplay.textContent = frameCount + ' FPS';
                 frameCount = 0;
@@ -623,19 +632,32 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
         const brightnessSlider = document.getElementById('brightness-slider');
         const brightnessValue = document.getElementById('brightness-value');
         brightnessSlider.addEventListener('input', function() {
+            brightnessValue.textContent = this.value;
+        });
+        brightnessSlider.addEventListener('change', function() {
             const value = this.value;
-            brightnessValue.textContent = value;
+            const timestamp = new Date().toISOString();
+            console.log(`[${timestamp}] BROWSER: Sending brightness=${value} to server`);
             fetch(`/process/brightness/${value}`, { method: 'POST' })
-                .catch(err => console.error('Failed to set brightness:', err));
+                .then(response => {
+                    const ts = new Date().toISOString();
+                    console.log(`[${ts}] BROWSER: Server responded OK to brightness change`);
+                })
+                .catch(err => {
+                    const ts = new Date().toISOString();
+                    console.error(`[${ts}] BROWSER: Failed to set brightness:`, err);
+                });
         });
 
         // Contrast slider (display as 0.1-3.0, send as 10-300)
         const contrastSlider = document.getElementById('contrast-slider');
         const contrastValue = document.getElementById('contrast-value');
         contrastSlider.addEventListener('input', function() {
-            const value = this.value;
-            const displayValue = (value / 100).toFixed(1);
+            const displayValue = (this.value / 100).toFixed(1);
             contrastValue.textContent = displayValue;
+        });
+        contrastSlider.addEventListener('change', function() {
+            const value = this.value;
             fetch(`/process/contrast/${value}`, { method: 'POST' })
                 .catch(err => console.error('Failed to set contrast:', err));
         });
@@ -644,22 +666,42 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
         const saturationSlider = document.getElementById('saturation-slider');
         const saturationValue = document.getElementById('saturation-value');
         saturationSlider.addEventListener('input', function() {
-            const value = this.value;
-            const displayValue = (value / 100).toFixed(1);
+            const displayValue = (this.value / 100).toFixed(1);
             saturationValue.textContent = displayValue;
+        });
+        saturationSlider.addEventListener('change', function() {
+            const value = this.value;
             fetch(`/process/saturation/${value}`, { method: 'POST' })
                 .catch(err => console.error('Failed to set saturation:', err));
         });
 
         // Flip controls
         function flipHorizontal() {
+            const timestamp = new Date().toISOString();
+            console.log(`[${timestamp}] BROWSER: Sending flip_h toggle to server`);
             fetch('/process/flip_h/toggle', { method: 'POST' })
-                .catch(err => console.error('Failed to flip horizontal:', err));
+                .then(response => {
+                    const ts = new Date().toISOString();
+                    console.log(`[${ts}] BROWSER: Server responded OK to flip_h`);
+                })
+                .catch(err => {
+                    const ts = new Date().toISOString();
+                    console.error(`[${ts}] BROWSER: Failed to flip horizontal:`, err);
+                });
         }
 
         function flipVertical() {
+            const timestamp = new Date().toISOString();
+            console.log(`[${timestamp}] BROWSER: Sending flip_v toggle to server`);
             fetch('/process/flip_v/toggle', { method: 'POST' })
-                .catch(err => console.error('Failed to flip vertical:', err));
+                .then(response => {
+                    const ts = new Date().toISOString();
+                    console.log(`[${ts}] BROWSER: Server responded OK to flip_v`);
+                })
+                .catch(err => {
+                    const ts = new Date().toISOString();
+                    console.error(`[${ts}] BROWSER: Failed to flip vertical:`, err);
+                });
         }
 
         // Rotation controls
@@ -675,8 +717,10 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
 
         // Zoom controls
         zoomSlider.addEventListener('input', function() {
+            zoomValue.textContent = this.value + '%';
+        });
+        zoomSlider.addEventListener('change', function() {
             const value = this.value;
-            zoomValue.textContent = value + '%';
             fetch(`/process/zoom/${value}`, { method: 'POST' })
                 .catch(err => console.error('Failed to set zoom:', err));
         });
@@ -685,20 +729,24 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             const currentZoom = parseInt(zoomSlider.value);
             zoomSlider.value = Math.min(400, currentZoom + 25);
             zoomSlider.dispatchEvent(new Event('input'));
+            zoomSlider.dispatchEvent(new Event('change'));
         }
 
         function zoomOut() {
             const currentZoom = parseInt(zoomSlider.value);
             zoomSlider.value = Math.max(50, currentZoom - 25);
             zoomSlider.dispatchEvent(new Event('input'));
+            zoomSlider.dispatchEvent(new Event('change'));
         }
 
         // Capture FPS slider
         const captureFpsSlider = document.getElementById('capture-fps-slider');
         const captureFpsValue = document.getElementById('capture-fps-value');
         captureFpsSlider.addEventListener('input', function() {
+            captureFpsValue.textContent = this.value;
+        });
+        captureFpsSlider.addEventListener('change', function() {
             const value = this.value;
-            captureFpsValue.textContent = value;
             fetch(`/capture/fps/${value}`, { method: 'POST' })
                 .catch(err => console.error('Failed to set capture FPS:', err));
         });
@@ -707,8 +755,10 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
         const qualitySlider = document.getElementById('quality-slider');
         const qualityValue = document.getElementById('quality-value');
         qualitySlider.addEventListener('input', function() {
+            qualityValue.textContent = this.value;
+        });
+        qualitySlider.addEventListener('change', function() {
             const value = this.value;
-            qualityValue.textContent = value;
             fetch(`/capture/quality/${value}`, { method: 'POST' })
                 .catch(err => console.error('Failed to set JPEG quality:', err));
         });
@@ -900,35 +950,70 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
             self.send_header('Pragma', 'no-cache')
             self.send_header('Expires', '0')
+            self.send_header('Connection', 'close')
             self.end_headers()
 
+            # Disable buffering on the socket for immediate frame delivery
+            try:
+                import socket
+                self.wfile.flush()
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except:
+                pass
+
             frame_delay = 1.0 / fps
-            last_frame_id = None
+            last_frame_number = -1
             stream_frame_count = 0
 
             try:
+                last_send_time = time.time()
+
                 while running:
                     with frame_lock:
                         frame = current_frame
-                        frame_id = id(current_frame)  # Get unique object ID
+                        frame_number = current_frame_number
 
-                    # Send frame if it's new (different object)
-                    if frame and frame_id != last_frame_id:
-                        # Write MJPEG frame with proper Content-Length header
-                        self.wfile.write(b'--frame\r\n')
-                        self.wfile.write(b'Content-Type: image/jpeg\r\n')
-                        self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
-                        self.wfile.write(frame)
-                        self.wfile.write(b'\r\n')
-                        self.wfile.flush()
-                        last_frame_id = frame_id
+                    # Send frame if it's new (different frame number)
+                    if frame and frame_number != last_frame_number:
+                        # Check if enough time has elapsed
+                        elapsed = time.time() - last_send_time
+                        if elapsed < frame_delay:
+                            # Sleep in small increments to stay responsive
+                            time.sleep(min(0.01, frame_delay - elapsed))
+                            continue
+
+                        last_send_time = time.time()
+
+                        # Write MJPEG frame part by part with flushes
+                        try:
+                            self.wfile.write(b'--frame\r\n')
+                            self.wfile.flush()
+
+                            self.wfile.write(b'Content-Type: image/jpeg\r\n')
+                            self.wfile.flush()
+
+                            self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
+                            self.wfile.flush()
+
+                            self.wfile.write(frame)
+                            self.wfile.flush()
+
+                            self.wfile.write(b'\r\n')
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            # Client disconnected
+                            break
+
+                        last_frame_number = frame_number
                         stream_frame_count += 1
 
                         # Debug: Print every 30 frames sent
                         if stream_frame_count % 30 == 0:
-                            print(f"[STREAM] Sent frame {stream_frame_count}, id={frame_id}")
-
-                    time.sleep(frame_delay)
+                            timestamp = datetime.now().isoformat()
+                            print(f"[{timestamp}] PYTHON STREAM: Sent frame {stream_frame_count} to browser, frame_num={frame_number}")
+                    else:
+                        # No new frame, sleep briefly
+                        time.sleep(0.01)
             except:
                 pass
 
@@ -979,48 +1064,49 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                 value_str = parts[3]
 
                 try:
+                    timestamp = datetime.now().isoformat()
                     if setting == 'brightness':
                         value = int(value_str)
                         with processing_lock:
                             processing_settings['brightness'] = value
-                        print(f"[PROCESS] Brightness: {value}")
+                        print(f"[{timestamp}] PYTHON: Received brightness={value}, updated settings")
 
                     elif setting == 'contrast':
                         value = int(value_str) / 100.0  # Convert 10-300 to 0.1-3.0
                         with processing_lock:
                             processing_settings['contrast'] = value
-                        print(f"[PROCESS] Contrast: {value:.2f}")
+                        print(f"[{timestamp}] PYTHON: Received contrast={value:.2f}, updated settings")
 
                     elif setting == 'saturation':
                         value = int(value_str) / 100.0  # Convert 0-300 to 0.0-3.0
                         with processing_lock:
                             processing_settings['saturation'] = value
-                        print(f"[PROCESS] Saturation: {value:.2f}")
+                        print(f"[{timestamp}] PYTHON: Received saturation={value:.2f}, updated settings")
 
                     elif setting == 'flip_h' and value_str == 'toggle':
                         with processing_lock:
                             processing_settings['flip_h'] = not processing_settings['flip_h']
                             new_state = processing_settings['flip_h']
-                        print(f"[PROCESS] Flip H: {new_state}")
+                        print(f"[{timestamp}] PYTHON: Received flip_h toggle, new state={new_state}")
 
                     elif setting == 'flip_v' and value_str == 'toggle':
                         with processing_lock:
                             processing_settings['flip_v'] = not processing_settings['flip_v']
                             new_state = processing_settings['flip_v']
-                        print(f"[PROCESS] Flip V: {new_state}")
+                        print(f"[{timestamp}] PYTHON: Received flip_v toggle, new state={new_state}")
 
                     elif setting == 'rotate':
                         delta = int(value_str)
                         with processing_lock:
                             processing_settings['rotate'] = (processing_settings['rotate'] + delta) % 360
                             new_rotation = processing_settings['rotate']
-                        print(f"[PROCESS] Rotation: {new_rotation}°")
+                        print(f"[{timestamp}] PYTHON: Received rotation delta={delta}, new rotation={new_rotation}°")
 
                     elif setting == 'zoom':
                         value = int(value_str) / 100.0  # Convert 50-400 to 0.5-4.0
                         with processing_lock:
                             processing_settings['zoom'] = value
-                        print(f"[PROCESS] Zoom: {value:.2f}x")
+                        print(f"[{timestamp}] PYTHON: Received zoom={value:.2f}x, updated settings")
 
                     else:
                         self.send_response(400)
@@ -1146,9 +1232,10 @@ def capture_usb():
             if frame_counter % 30 == 0:
                 actual_fps = 30.0 / (time.time() - last_debug_time)
                 last_debug_time = time.time()
+                timestamp = datetime.now().isoformat()
                 with processing_lock:
                     settings_str = f"B:{processing_settings['brightness']} C:{processing_settings['contrast']:.1f} S:{processing_settings['saturation']:.1f} Z:{processing_settings['zoom']:.1f}x"
-                print(f"[DEBUG] {actual_fps:.1f} fps | {settings_str}")
+                print(f"[{timestamp}] PYTHON CAPTURE: Processing frame {frame_counter} with settings: {settings_str}, {actual_fps:.1f} fps")
 
             # Apply all image processing in Python
             processed_frame = apply_image_processing(frame)
@@ -1160,13 +1247,17 @@ def capture_usb():
                 ret, jpeg = cv2.imencode('.jpg', processed_frame, encode_params)
 
             if ret:
+                global current_frame_number
                 new_frame = jpeg.tobytes()
                 with frame_lock:
                     current_frame = new_frame
+                    current_frame_number += 1
+                    frame_num = current_frame_number
                 frame_event.set()
                 # Debug: Print when we update the frame
                 if frame_counter % 30 == 0:
-                    print(f"[FRAME] Updated current_frame, id={id(new_frame)}")
+                    timestamp = datetime.now().isoformat()
+                    print(f"[{timestamp}] PYTHON CAPTURE: Encoded and stored frame_num={frame_num}")
         else:
             time.sleep(0.01)
 
@@ -1217,6 +1308,7 @@ def capture_wifi():
                                     if len(frame_buffer) >= 4 and frame_buffer[0:2] == b'\xff\xd8':
                                         if frame_buffer[-2:] == b'\xff\xd9':
                                             # Decode JPEG to apply processing
+                                            global current_frame_number
                                             if USB_AVAILABLE:
                                                 nparr = np.frombuffer(frame_buffer, np.uint8)
                                                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -1243,11 +1335,13 @@ def capture_wifi():
                                                     if ret:
                                                         with frame_lock:
                                                             current_frame = jpeg.tobytes()
+                                                            current_frame_number += 1
                                                         frame_event.set()
                                             else:
                                                 # No OpenCV - just pass through raw frames
                                                 with frame_lock:
                                                     current_frame = bytes(frame_buffer)
+                                                    current_frame_number += 1
                                                 frame_event.set()
 
                                 frame_buffer = bytearray()
@@ -1330,8 +1424,8 @@ def main():
     else:
         print("\n⚠ No microscope detected - waiting for connection...")
 
-    # Start web server
-    server = HTTPServer(('', WEB_PORT), MicroscopeHandler)
+    # Start web server with threading for better concurrent connection handling
+    server = ThreadingHTTPServer(('', WEB_PORT), MicroscopeHandler)
     print(f"\nWeb viewer running at: http://localhost:{WEB_PORT}")
     print("Press Ctrl+C to stop\n")
     print("Keyboard shortcuts:")
