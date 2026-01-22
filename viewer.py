@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Web-based viewer for WiFi/USB microscope
 # Captures images and serves them via HTTP with MJPEG streaming
 # Supports both WiFi (UDP) and USB (webcam) modes
