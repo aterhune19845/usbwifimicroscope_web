@@ -887,12 +887,20 @@ def capture_usb():
     while running:
         ret, frame = cap.read()
         if ret:
-            # Convert frame to JPEG
-            ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            # Convert frame to JPEG with optimized settings for clean encoding
+            encode_params = [
+                cv2.IMWRITE_JPEG_QUALITY, 90,
+                cv2.IMWRITE_JPEG_OPTIMIZE, 1,
+                cv2.IMWRITE_JPEG_PROGRESSIVE, 0
+            ]
+            ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
             if ret:
-                with frame_lock:
-                    current_frame = jpeg.tobytes()
-                frame_event.set()
+                jpeg_bytes = jpeg.tobytes()
+                # Validate JPEG has proper end marker
+                if len(jpeg_bytes) >= 2 and jpeg_bytes[-2:] == b'\xff\xd9':
+                    with frame_lock:
+                        current_frame = jpeg_bytes
+                    frame_event.set()
         else:
             time.sleep(0.01)
 

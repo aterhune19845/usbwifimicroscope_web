@@ -1,0 +1,5 @@
+# Optional: Only needed for USB microscope support
+# WiFi mode works without any additional packages
+
+# For USB camera support
+opencv-python>=4.5.0
