@@ -3,3 +3,6 @@
 
 # For USB camera support
 opencv-python>=4.5.0
+
+# For better JPEG encoding (reduces corruption warnings)
+Pillow>=8.0.0

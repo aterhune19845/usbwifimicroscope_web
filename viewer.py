@@ -8,10 +8,19 @@ import socket
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import sys
+import io
+
+# Try to import PIL for better JPEG encoding
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # Try to import OpenCV for USB camera support
 try:
     import cv2
+    import numpy as np
     USB_AVAILABLE = True
 except ImportError:
     USB_AVAILABLE = False
@@ -887,26 +896,36 @@ def capture_usb():
     while running:
         ret, frame = cap.read()
         if ret:
-            # Convert frame to JPEG with optimized settings for clean encoding
-            encode_params = [
-                cv2.IMWRITE_JPEG_QUALITY, 90,
-                cv2.IMWRITE_JPEG_OPTIMIZE, 1,
-                cv2.IMWRITE_JPEG_PROGRESSIVE, 0
-            ]
-            ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
-            if ret:
+            # Use PIL for better JPEG encoding if available, otherwise OpenCV
+            if PIL_AVAILABLE:
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Create PIL Image
+                pil_image = Image.fromarray(frame_rgb)
+                # Encode to JPEG using PIL (produces cleaner JPEGs)
+                buffer = io.BytesIO()
+                pil_image.save(buffer, format='JPEG', quality=90, optimize=True)
+                jpeg_bytes = buffer.getvalue()
+            else:
+                # Fallback to OpenCV encoding
+                encode_params = [
+                    cv2.IMWRITE_JPEG_QUALITY, 90,
+                    cv2.IMWRITE_JPEG_OPTIMIZE, 1,
+                    cv2.IMWRITE_JPEG_PROGRESSIVE, 0
+                ]
+                ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
+                if not ret:
+                    continue
                 jpeg_bytes = jpeg.tobytes()
 
-                # Fix: Strip any extraneous bytes after JPEG end marker (FF D9)
-                # Find the last occurrence of the JPEG end marker
+                # Strip any extraneous bytes after JPEG end marker (FF D9)
                 end_marker_pos = jpeg_bytes.rfind(b'\xff\xd9')
                 if end_marker_pos != -1:
-                    # Truncate everything after the end marker
                     jpeg_bytes = jpeg_bytes[:end_marker_pos + 2]
 
-                    with frame_lock:
-                        current_frame = jpeg_bytes
-                    frame_event.set()
+            with frame_lock:
+                current_frame = jpeg_bytes
+            frame_event.set()
         else:
             time.sleep(0.01)
 
