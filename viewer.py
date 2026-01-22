@@ -57,8 +57,8 @@ processing_lock = threading.Lock()
 usb_camera_cap = None  # Global reference to camera
 
 # Capture settings
-capture_fps = 15  # Capture FPS (independent of stream FPS)
-jpeg_quality = 75  # JPEG encoding quality (1-100)
+capture_fps = 15  # Capture FPS (independent of stream FPS) - reduce to 10 on Pi if slow
+jpeg_quality = 70  # JPEG encoding quality (1-100) - lower = faster encoding
 capture_settings_lock = threading.Lock()
 
 # Context manager to suppress libjpeg warnings
@@ -80,32 +80,24 @@ def apply_image_processing(frame):
     with processing_lock:
         settings = processing_settings.copy()
 
-    # Debug: Show what settings we're applying
-    # print(f"[APPLY] Settings: B={settings['brightness']} C={settings['contrast']:.1f} S={settings['saturation']:.1f}")
+    # Start with original frame as uint8
+    processed = frame
 
-    # Convert to float for processing
-    processed = frame.astype(np.float32)
-
-    # 1. Apply brightness and contrast
-    # Formula: output = alpha * input + beta
-    # alpha = contrast, beta = brightness
+    # 1. Apply brightness and contrast (if needed)
     if settings['brightness'] != 0 or settings['contrast'] != 1.0:
         processed = cv2.convertScaleAbs(
             processed,
             alpha=settings['contrast'],
             beta=settings['brightness']
         )
-        processed = processed.astype(np.float32)
 
-    # 2. Apply saturation
+    # 2. Apply saturation (if needed)
     if settings['saturation'] != 1.0:
         # Convert to HSV to adjust saturation
-        hsv = cv2.cvtColor(processed.astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv = cv2.cvtColor(processed, cv2.COLOR_BGR2HSV)
+        hsv = hsv.astype(np.float32)
         hsv[:, :, 1] = np.clip(hsv[:, :, 1] * settings['saturation'], 0, 255)
-        processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
-
-    # Convert back to uint8 for geometric transforms
-    processed = np.clip(processed, 0, 255).astype(np.uint8)
+        processed = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
     # 3. Apply flip
     if settings['flip_h'] and settings['flip_v']:
@@ -124,7 +116,7 @@ def apply_image_processing(frame):
     elif rotation == 270:
         processed = cv2.rotate(processed, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-    # 5. Apply zoom (center crop and resize)
+    # 5. Apply zoom (center crop and resize) - if needed
     zoom = settings['zoom']
     if zoom != 1.0:
         h, w = processed.shape[:2]
@@ -136,6 +128,7 @@ def apply_image_processing(frame):
             start_y = (h - crop_h) // 2
             start_x = (w - crop_w) // 2
             cropped = processed[start_y:start_y+crop_h, start_x:start_x+crop_w]
+            # Use INTER_NEAREST for speed on Pi, INTER_LINEAR for quality on desktop
             processed = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
             # Zoom out - resize smaller and pad with black
@@ -1311,7 +1304,8 @@ def capture_wifi():
                                             global current_frame_number
                                             if USB_AVAILABLE:
                                                 nparr = np.frombuffer(frame_buffer, np.uint8)
-                                                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                                with SuppressStderr():
+                                                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
                                                 if frame is not None:
                                                     frame_counter += 1
