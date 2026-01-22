@@ -903,22 +903,21 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             self.end_headers()
 
             frame_delay = 1.0 / fps
-            last_frame = None
 
             try:
                 while running:
                     with frame_lock:
                         frame = current_frame
 
-                    if frame and frame != last_frame:
+                    if frame:
                         # Write MJPEG frame with proper Content-Length header
+                        # Always send frames, don't compare to last_frame
                         self.wfile.write(b'--frame\r\n')
                         self.wfile.write(b'Content-Type: image/jpeg\r\n')
                         self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
                         self.wfile.flush()
-                        last_frame = frame
 
                     time.sleep(frame_delay)
             except:
@@ -974,50 +973,45 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     if setting == 'brightness':
                         value = int(value_str)
                         with processing_lock:
-                            old_val = processing_settings['brightness']
                             processing_settings['brightness'] = value
-                        print(f"[PROCESS] *** BRIGHTNESS CHANGED: {old_val} -> {value} ***")
+                        print(f"[PROCESS] Brightness: {value}")
 
                     elif setting == 'contrast':
                         value = int(value_str) / 100.0  # Convert 10-300 to 0.1-3.0
                         with processing_lock:
-                            old_val = processing_settings['contrast']
                             processing_settings['contrast'] = value
-                        print(f"[PROCESS] *** CONTRAST CHANGED: {old_val:.2f} -> {value:.2f} ***")
+                        print(f"[PROCESS] Contrast: {value:.2f}")
 
                     elif setting == 'saturation':
                         value = int(value_str) / 100.0  # Convert 0-300 to 0.0-3.0
                         with processing_lock:
-                            old_val = processing_settings['saturation']
                             processing_settings['saturation'] = value
-                        print(f"[PROCESS] *** SATURATION CHANGED: {old_val:.2f} -> {value:.2f} ***")
+                        print(f"[PROCESS] Saturation: {value:.2f}")
 
                     elif setting == 'flip_h' and value_str == 'toggle':
                         with processing_lock:
                             processing_settings['flip_h'] = not processing_settings['flip_h']
                             new_state = processing_settings['flip_h']
-                        print(f"[PROCESS] *** FLIP H TOGGLED: {new_state} ***")
+                        print(f"[PROCESS] Flip H: {new_state}")
 
                     elif setting == 'flip_v' and value_str == 'toggle':
                         with processing_lock:
                             processing_settings['flip_v'] = not processing_settings['flip_v']
                             new_state = processing_settings['flip_v']
-                        print(f"[PROCESS] *** FLIP V TOGGLED: {new_state} ***")
+                        print(f"[PROCESS] Flip V: {new_state}")
 
                     elif setting == 'rotate':
                         delta = int(value_str)
                         with processing_lock:
-                            old_rotation = processing_settings['rotate']
                             processing_settings['rotate'] = (processing_settings['rotate'] + delta) % 360
                             new_rotation = processing_settings['rotate']
-                        print(f"[PROCESS] *** ROTATION CHANGED: {old_rotation}° -> {new_rotation}° ***")
+                        print(f"[PROCESS] Rotation: {new_rotation}°")
 
                     elif setting == 'zoom':
                         value = int(value_str) / 100.0  # Convert 50-400 to 0.5-4.0
                         with processing_lock:
-                            old_val = processing_settings['zoom']
                             processing_settings['zoom'] = value
-                        print(f"[PROCESS] *** ZOOM CHANGED: {old_val:.2f}x -> {value:.2f}x ***")
+                        print(f"[PROCESS] Zoom: {value:.2f}x")
 
                     else:
                         self.send_response(400)
@@ -1124,11 +1118,14 @@ def capture_usb():
         current_fps = capture_fps
         current_quality = jpeg_quality
 
+        # Check if enough time has elapsed for next frame
         if current_fps > 0:
             frame_delay = 1.0 / current_fps
             elapsed = time.time() - last_capture_time
             if elapsed < frame_delay:
-                time.sleep(frame_delay - elapsed)
+                # Sleep in small increments to remain responsive
+                time.sleep(min(0.01, frame_delay - elapsed))
+                continue  # Check again next iteration
 
         last_capture_time = time.time()
 
@@ -1141,17 +1138,11 @@ def capture_usb():
                 actual_fps = 30.0 / (time.time() - last_debug_time)
                 last_debug_time = time.time()
                 with processing_lock:
-                    settings_str = f"B:{processing_settings['brightness']} C:{processing_settings['contrast']:.1f} S:{processing_settings['saturation']:.1f} Z:{processing_settings['zoom']:.1f}x R:{processing_settings['rotate']}° FlipH:{processing_settings['flip_h']} FlipV:{processing_settings['flip_v']}"
+                    settings_str = f"B:{processing_settings['brightness']} C:{processing_settings['contrast']:.1f} S:{processing_settings['saturation']:.1f} Z:{processing_settings['zoom']:.1f}x"
                 print(f"[DEBUG] {actual_fps:.1f} fps | {settings_str}")
 
             # Apply all image processing in Python
             processed_frame = apply_image_processing(frame)
-
-            # Verify processing is changing the frame
-            if frame_counter % 90 == 0:
-                frame_mean = np.mean(frame)
-                processed_mean = np.mean(processed_frame)
-                print(f"[VERIFY] Original mean: {frame_mean:.1f}, Processed mean: {processed_mean:.1f}, Diff: {abs(processed_mean - frame_mean):.1f}")
 
             # Encode to JPEG
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, current_quality]
