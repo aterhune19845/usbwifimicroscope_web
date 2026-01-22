@@ -944,14 +944,15 @@ def capture_usb():
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     # Create PIL Image
                     pil_image = Image.fromarray(frame_rgb)
-                    # Encode to JPEG with baseline (non-progressive) and proper subsampling
+                    # Encode to JPEG with settings that avoid libjpeg warnings
                     buffer = io.BytesIO()
+                    # Use 4:4:4 subsampling (no chroma subsampling) to avoid warnings
                     pil_image.save(buffer,
                                  format='JPEG',
-                                 quality=85,
+                                 quality=80,
                                  optimize=False,
                                  progressive=False,
-                                 subsampling='4:2:0')
+                                 subsampling=0)  # 0 = 4:4:4 (no subsampling)
                     jpeg_bytes = buffer.getvalue()
 
                     # Debug JPEG output
