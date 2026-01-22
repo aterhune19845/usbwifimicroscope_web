@@ -890,26 +890,39 @@ def capture_usb():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer to reduce lag
 
-    print("Capturing from USB microscope...")
+    encoding_method = "PIL" if PIL_AVAILABLE else "OpenCV"
+    print(f"Capturing from USB microscope (using {encoding_method} encoding)...")
+
+    frame_count = 0
+    last_time = time.time()
 
     while running:
         ret, frame = cap.read()
         if ret:
             # Use PIL for better JPEG encoding if available, otherwise OpenCV
             if PIL_AVAILABLE:
-                # Convert BGR to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Create PIL Image
-                pil_image = Image.fromarray(frame_rgb)
-                # Encode to JPEG using PIL (produces cleaner JPEGs)
-                buffer = io.BytesIO()
-                pil_image.save(buffer, format='JPEG', quality=90, optimize=True)
-                jpeg_bytes = buffer.getvalue()
+                try:
+                    # Convert BGR to RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Create PIL Image
+                    pil_image = Image.fromarray(frame_rgb)
+                    # Encode to JPEG using PIL with optimal settings
+                    buffer = io.BytesIO()
+                    pil_image.save(buffer, format='JPEG', quality=85, optimize=True, subsampling=0)
+                    jpeg_bytes = buffer.getvalue()
+
+                    # Validate JPEG structure
+                    if len(jpeg_bytes) < 4 or jpeg_bytes[:2] != b'\xff\xd8' or jpeg_bytes[-2:] != b'\xff\xd9':
+                        continue
+                except Exception as e:
+                    # If PIL fails, skip this frame
+                    continue
             else:
                 # Fallback to OpenCV encoding
                 encode_params = [
-                    cv2.IMWRITE_JPEG_QUALITY, 90,
+                    cv2.IMWRITE_JPEG_QUALITY, 85,
                     cv2.IMWRITE_JPEG_OPTIMIZE, 1,
                     cv2.IMWRITE_JPEG_PROGRESSIVE, 0
                 ]
@@ -920,12 +933,20 @@ def capture_usb():
 
                 # Strip any extraneous bytes after JPEG end marker (FF D9)
                 end_marker_pos = jpeg_bytes.rfind(b'\xff\xd9')
-                if end_marker_pos != -1:
-                    jpeg_bytes = jpeg_bytes[:end_marker_pos + 2]
+                if end_marker_pos == -1:
+                    continue
+                jpeg_bytes = jpeg_bytes[:end_marker_pos + 2]
+
+                # Validate start marker
+                if len(jpeg_bytes) < 4 or jpeg_bytes[:2] != b'\xff\xd8':
+                    continue
 
             with frame_lock:
                 current_frame = jpeg_bytes
             frame_event.set()
+
+            # Rate limiting to prevent overwhelming the browser
+            time.sleep(0.033)  # ~30 fps max
         else:
             time.sleep(0.01)
 
