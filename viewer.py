@@ -40,6 +40,22 @@ running = True
 target_fps = 29  # Default target FPS for streaming
 connection_mode = None  # Will be 'wifi', 'usb', or None
 
+# Camera settings (0-100 scale, will be converted to camera-specific ranges)
+camera_settings = {
+    'brightness': 50,
+    'contrast': 50,
+    'saturation': 50,
+    'sharpness': 50,
+    'exposure': 50
+}
+camera_settings_lock = threading.Lock()
+usb_camera_cap = None  # Global reference to camera for settings adjustment
+
+# Capture settings that affect encoding
+capture_fps = 15  # Capture FPS (independent of stream FPS)
+jpeg_quality = 70  # JPEG encoding quality (1-100)
+capture_settings_lock = threading.Lock()
+
 # Context manager to suppress libjpeg warnings
 class SuppressStderr:
     def __enter__(self):
@@ -410,11 +426,44 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             </div>
 
             <div class="control-group">
-                <h3>Stream Settings</h3>
+                <h3>Capture Settings</h3>
                 <div class="slider-control">
-                    <label>Target FPS: <span class="slider-value" id="fps-value">29</span></label>
+                    <label>Capture FPS: <span class="slider-value" id="capture-fps-value">15</span></label>
+                    <input type="range" id="capture-fps-slider" min="1" max="30" value="15" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>JPEG Quality: <span class="slider-value" id="quality-value">70</span></label>
+                    <input type="range" id="quality-slider" min="10" max="100" value="70" step="5">
+                </div>
+                <div class="slider-control">
+                    <label>Stream FPS: <span class="slider-value" id="fps-value">29</span></label>
                     <input type="range" id="fps-slider" min="1" max="29" value="29" step="1">
                 </div>
+            </div>
+
+            <div class="control-group">
+                <h3>Camera Settings</h3>
+                <div class="slider-control">
+                    <label>Brightness: <span class="slider-value" id="brightness-value">50</span></label>
+                    <input type="range" id="brightness-slider" min="0" max="100" value="50" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>Contrast: <span class="slider-value" id="contrast-value">50</span></label>
+                    <input type="range" id="contrast-slider" min="0" max="100" value="50" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>Saturation: <span class="slider-value" id="saturation-value">50</span></label>
+                    <input type="range" id="saturation-slider" min="0" max="100" value="50" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>Sharpness: <span class="slider-value" id="sharpness-value">50</span></label>
+                    <input type="range" id="sharpness-slider" min="0" max="100" value="50" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>Exposure: <span class="slider-value" id="exposure-value">50</span></label>
+                    <input type="range" id="exposure-slider" min="0" max="100" value="50" step="1">
+                </div>
+                <button onclick="resetCameraSettings()">Reset Camera Settings</button>
             </div>
 
             <div class="control-group">
@@ -578,6 +627,54 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             // Reconnect stream with new FPS
             img.src = '/stream.mjpg?fps=' + value + '&t=' + Date.now();
         });
+
+        // Capture FPS slider
+        const captureFpsSlider = document.getElementById('capture-fps-slider');
+        const captureFpsValue = document.getElementById('capture-fps-value');
+        captureFpsSlider.addEventListener('input', function() {
+            const value = this.value;
+            captureFpsValue.textContent = value;
+            fetch(`/capture/fps/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set capture FPS:', err));
+        });
+
+        // JPEG quality slider
+        const qualitySlider = document.getElementById('quality-slider');
+        const qualityValue = document.getElementById('quality-value');
+        qualitySlider.addEventListener('input', function() {
+            const value = this.value;
+            qualityValue.textContent = value;
+            fetch(`/capture/quality/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set JPEG quality:', err));
+        });
+
+        // Camera settings sliders
+        const cameraSettings = ['brightness', 'contrast', 'saturation', 'sharpness', 'exposure'];
+        cameraSettings.forEach(setting => {
+            const slider = document.getElementById(`${setting}-slider`);
+            const valueDisplay = document.getElementById(`${setting}-value`);
+
+            slider.addEventListener('input', function() {
+                const value = this.value;
+                valueDisplay.textContent = value;
+
+                // Send camera setting to server
+                fetch(`/camera/${setting}/${value}`, { method: 'POST' })
+                    .catch(err => console.error(`Failed to set ${setting}:`, err));
+            });
+        });
+
+        function resetCameraSettings() {
+            cameraSettings.forEach(setting => {
+                const slider = document.getElementById(`${setting}-slider`);
+                const valueDisplay = document.getElementById(`${setting}-value`);
+                slider.value = 50;
+                valueDisplay.textContent = '50';
+
+                fetch(`/camera/${setting}/50`, { method: 'POST' })
+                    .catch(err => console.error(`Failed to reset ${setting}:`, err));
+            });
+        }
 
         function takeScreenshot() {
             // Create a canvas to capture the current frame
@@ -874,13 +971,117 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self):
+        global camera_settings, usb_camera_cap, capture_fps, jpeg_quality
+
+        # Handle camera settings API
+        if self.path.startswith('/camera/'):
+            parts = self.path.split('/')
+            if len(parts) == 4:
+                setting = parts[2]
+                try:
+                    value = int(parts[3])
+                    if setting in camera_settings and 0 <= value <= 100:
+                        with camera_settings_lock:
+                            camera_settings[setting] = value
+
+                        # Apply setting to USB camera if available
+                        if usb_camera_cap and connection_mode == 'usb':
+                            apply_camera_setting(usb_camera_cap, setting, value)
+
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(b'{"status": "ok"}')
+                        return
+                except:
+                    pass
+
+            self.send_response(400)
+            self.end_headers()
+
+        # Handle capture settings API
+        elif self.path.startswith('/capture/'):
+            parts = self.path.split('/')
+            if len(parts) == 4:
+                setting = parts[2]
+                try:
+                    value = int(parts[3])
+
+                    if setting == 'fps' and 1 <= value <= 30:
+                        with capture_settings_lock:
+                            capture_fps = value
+                        # Also update camera FPS if USB
+                        if usb_camera_cap and connection_mode == 'usb':
+                            usb_camera_cap.set(cv2.CAP_PROP_FPS, value)
+
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(b'{"status": "ok"}')
+                        return
+
+                    elif setting == 'quality' and 10 <= value <= 100:
+                        with capture_settings_lock:
+                            jpeg_quality = value
+
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(b'{"status": "ok"}')
+                        return
+                except:
+                    pass
+
+            self.send_response(400)
+            self.end_headers()
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def log_message(self, fmt, *arguments):
         # Suppress logging
         pass
 
+def apply_camera_setting(cap, setting, value):
+    """Apply camera setting to USB camera (value is 0-100)"""
+    # Map setting names to OpenCV properties
+    property_map = {
+        'brightness': cv2.CAP_PROP_BRIGHTNESS,
+        'contrast': cv2.CAP_PROP_CONTRAST,
+        'saturation': cv2.CAP_PROP_SATURATION,
+        'sharpness': cv2.CAP_PROP_SHARPNESS,
+        'exposure': cv2.CAP_PROP_EXPOSURE
+    }
+
+    if setting not in property_map:
+        return
+
+    prop = property_map[setting]
+
+    # Convert 0-100 scale to camera-specific range
+    # Most cameras use different ranges, try normalized 0.0-1.0 first
+    normalized_value = value / 100.0
+
+    try:
+        # For exposure, cameras often need negative values for auto
+        if setting == 'exposure':
+            # Try setting exposure mode to manual first
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual mode
+            # Map 0-100 to a reasonable exposure range (camera dependent)
+            # Middle value (50) = 0, lower = negative, higher = positive
+            exposure_value = (value - 50) / 10.0
+            cap.set(prop, exposure_value)
+        else:
+            # For other settings, try normalized value
+            cap.set(prop, normalized_value)
+    except:
+        pass
+
 def capture_usb():
     """Capture frames from USB microscope"""
-    global current_frame, running, connection_mode
+    global current_frame, running, connection_mode, usb_camera_cap, camera_settings
 
     if not USB_AVAILABLE:
         print("ERROR: OpenCV not available for USB capture")
@@ -903,117 +1104,49 @@ def capture_usb():
         print("No USB microscope found")
         return
 
-    # Set camera properties for best performance
+    # Set global reference for settings adjustment
+    usb_camera_cap = cap
+
+    # Set camera properties optimized for Raspberry Pi 3
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FPS, 15)  # Lower FPS for Pi 3 performance
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer to reduce lag
 
-    encoding_method = "PIL" if PIL_AVAILABLE else "OpenCV"
-    print(f"Capturing from USB microscope (using {encoding_method} encoding)...")
+    # Try to get MJPEG directly from camera (skips encoding if camera supports it)
+    try:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    except:
+        pass
 
-    frame_count = 0
-    debug_frame_count = 0
+    # Apply initial camera settings
+    with camera_settings_lock:
+        for setting, value in camera_settings.items():
+            apply_camera_setting(cap, setting, value)
+
+    print(f"Capturing from USB microscope (optimized for Raspberry Pi 3)...")
+    print(f"Camera controls available in web interface")
+    print(f"Note: libjpeg warnings are harmless and can be ignored\n")
 
     while running:
         ret, frame = cap.read()
         if ret:
-            frame_count += 1
+            # Get current JPEG quality setting
+            with capture_settings_lock:
+                current_quality = jpeg_quality
 
-            # Debug: Print frame info every 30 frames
-            if frame_count % 30 == 1:
-                height, width = frame.shape[:2]
-                print(f"\n[DEBUG] Frame #{frame_count}")
-                print(f"  Original dimensions: {width}x{height}")
-                print(f"  Frame dtype: {frame.dtype}, shape: {frame.shape}")
+            # Fast OpenCV JPEG encoding with adjustable quality
+            encode_params = [cv2.IMWRITE_JPEG_QUALITY, current_quality]
 
-            # Ensure frame dimensions are multiples of 16 (JPEG MCU size)
-            height, width = frame.shape[:2]
-            new_height = (height // 16) * 16
-            new_width = (width // 16) * 16
-
-            if new_height != height or new_width != width:
-                if frame_count % 30 == 1:
-                    print(f"  Resizing to: {new_width}x{new_height}")
-                frame = cv2.resize(frame, (new_width, new_height))
-
-            # Use PIL for better JPEG encoding if available, otherwise OpenCV
-            if PIL_AVAILABLE:
-                try:
-                    # Convert BGR to RGB
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    # Create PIL Image
-                    pil_image = Image.fromarray(frame_rgb)
-                    # Encode to JPEG with settings that avoid libjpeg warnings
-                    buffer = io.BytesIO()
-                    # Use 4:4:4 subsampling (no chroma subsampling) to avoid warnings
-                    pil_image.save(buffer,
-                                 format='JPEG',
-                                 quality=80,
-                                 optimize=False,
-                                 progressive=False,
-                                 subsampling=0)  # 0 = 4:4:4 (no subsampling)
-                    jpeg_bytes = buffer.getvalue()
-
-                    # Debug JPEG output
-                    if frame_count % 30 == 1:
-                        print(f"  PIL JPEG size: {len(jpeg_bytes)} bytes")
-                        print(f"  Start marker: {jpeg_bytes[:2].hex()}")
-                        print(f"  End marker: {jpeg_bytes[-2:].hex()}")
-                        # Check for extra bytes after end marker
-                        end_pos = jpeg_bytes.rfind(b'\xff\xd9')
-                        extra_bytes = len(jpeg_bytes) - (end_pos + 2)
-                        print(f"  Bytes after end marker: {extra_bytes}")
-
-                    # Validate JPEG structure
-                    if len(jpeg_bytes) < 4 or jpeg_bytes[:2] != b'\xff\xd8' or jpeg_bytes[-2:] != b'\xff\xd9':
-                        print(f"[WARNING] Invalid JPEG structure on frame {frame_count}")
-                        continue
-                except Exception as e:
-                    print(f"[ERROR] PIL encoding failed on frame {frame_count}: {e}")
-                    continue
-            else:
-                # Fallback to OpenCV encoding with baseline settings
-                encode_params = [
-                    cv2.IMWRITE_JPEG_QUALITY, 85,
-                    cv2.IMWRITE_JPEG_OPTIMIZE, 0,
-                    cv2.IMWRITE_JPEG_PROGRESSIVE, 0,
-                    cv2.IMWRITE_JPEG_LUMA_QUALITY, 85,
-                    cv2.IMWRITE_JPEG_CHROMA_QUALITY, 85
-                ]
+            with SuppressStderr():  # Suppress libjpeg warnings
                 ret, jpeg = cv2.imencode('.jpg', frame, encode_params)
-                if not ret:
-                    print(f"[ERROR] OpenCV encoding failed on frame {frame_count}")
-                    continue
-                jpeg_bytes = jpeg.tobytes()
 
-                # Debug JPEG output
-                if frame_count % 30 == 1:
-                    print(f"  OpenCV JPEG size: {len(jpeg_bytes)} bytes")
-                    print(f"  Start marker: {jpeg_bytes[:2].hex()}")
-                    end_pos = jpeg_bytes.rfind(b'\xff\xd9')
-                    print(f"  End marker position: {end_pos} (total: {len(jpeg_bytes)})")
-                    extra_bytes = len(jpeg_bytes) - (end_pos + 2)
-                    print(f"  Bytes after end marker: {extra_bytes}")
+            if ret:
+                with frame_lock:
+                    current_frame = jpeg.tobytes()
+                frame_event.set()
 
-                # Strip any extraneous bytes after JPEG end marker (FF D9)
-                end_marker_pos = jpeg_bytes.rfind(b'\xff\xd9')
-                if end_marker_pos == -1:
-                    print(f"[ERROR] No end marker found on frame {frame_count}")
-                    continue
-                jpeg_bytes = jpeg_bytes[:end_marker_pos + 2]
-
-                # Validate start marker
-                if len(jpeg_bytes) < 4 or jpeg_bytes[:2] != b'\xff\xd8':
-                    print(f"[ERROR] No start marker found on frame {frame_count}")
-                    continue
-
-            with frame_lock:
-                current_frame = jpeg_bytes
-            frame_event.set()
-
-            # Rate limiting
-            time.sleep(0.05)  # ~20 fps max
+            # No sleep - let it run as fast as possible
         else:
             time.sleep(0.01)
 
