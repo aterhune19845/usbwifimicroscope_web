@@ -843,10 +843,13 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                         frame = current_frame
 
                     if frame and frame != last_frame:
+                        # Write MJPEG frame with proper Content-Length header
                         self.wfile.write(b'--frame\r\n')
-                        self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
+                        self.wfile.write(b'Content-Type: image/jpeg\r\n')
+                        self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
+                        self.wfile.flush()  # Force flush to prevent buffering issues
                         last_frame = frame
 
                     time.sleep(frame_delay)
