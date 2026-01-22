@@ -1013,7 +1013,10 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                             capture_fps = value
                         # Also update camera FPS if USB
                         if usb_camera_cap and connection_mode == 'usb':
+                            old_fps = usb_camera_cap.get(cv2.CAP_PROP_FPS)
                             usb_camera_cap.set(cv2.CAP_PROP_FPS, value)
+                            new_fps = usb_camera_cap.get(cv2.CAP_PROP_FPS)
+                            print(f"[CAPTURE] Camera FPS: {old_fps:.1f} -> {new_fps:.1f} (requested: {value})")
 
                         self.send_response(200)
                         self.send_header('Content-type', 'application/json')
@@ -1024,6 +1027,7 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     elif setting == 'quality' and 10 <= value <= 100:
                         with capture_settings_lock:
                             jpeg_quality = value
+                        print(f"[CAPTURE] JPEG quality set to: {value}")
 
                         self.send_response(200)
                         self.send_header('Content-type', 'application/json')
@@ -1060,24 +1064,44 @@ def apply_camera_setting(cap, setting, value):
 
     prop = property_map[setting]
 
-    # Convert 0-100 scale to camera-specific range
-    # Most cameras use different ranges, try normalized 0.0-1.0 first
-    normalized_value = value / 100.0
+    # Get current value and range to understand what camera supports
+    old_value = cap.get(prop)
+
+    # Different cameras use different ranges - try multiple approaches
+    success = False
 
     try:
-        # For exposure, cameras often need negative values for auto
         if setting == 'exposure':
-            # Try setting exposure mode to manual first
+            # Exposure is tricky - try disabling auto exposure first
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual mode
-            # Map 0-100 to a reasonable exposure range (camera dependent)
-            # Middle value (50) = 0, lower = negative, higher = positive
-            exposure_value = (value - 50) / 10.0
+            # Try absolute value range (camera dependent, usually -13 to -1 for webcams)
+            exposure_value = -13 + (value / 100.0) * 12  # Maps 0-100 to -13 to -1
             cap.set(prop, exposure_value)
+            new_value = cap.get(prop)
+            print(f"[CAMERA] {setting}: {old_value:.2f} -> {new_value:.2f} (target: {exposure_value:.2f})")
+            success = (new_value != old_value)
         else:
-            # For other settings, try normalized value
-            cap.set(prop, normalized_value)
-    except:
-        pass
+            # Try multiple value ranges to see what works
+            attempts = [
+                value / 100.0,           # 0.0 - 1.0
+                value,                    # 0 - 100
+                (value - 50) / 50.0,     # -1.0 to 1.0
+                value / 255.0 * 100,     # 0 - 100 (some cameras)
+            ]
+
+            for attempt_value in attempts:
+                cap.set(prop, attempt_value)
+                new_value = cap.get(prop)
+                if new_value != old_value:
+                    print(f"[CAMERA] {setting}: {old_value:.2f} -> {new_value:.2f} (input: {value})")
+                    success = True
+                    break
+
+        if not success:
+            print(f"[CAMERA] {setting}: No change (camera may not support this property)")
+
+    except Exception as e:
+        print(f"[CAMERA] Error setting {setting}: {e}")
 
 def capture_usb():
     """Capture frames from USB microscope"""
