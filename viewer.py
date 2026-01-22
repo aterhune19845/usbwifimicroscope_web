@@ -1009,8 +1009,10 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     value = int(parts[3])
 
                     if setting == 'fps' and 1 <= value <= 30:
-                        with capture_settings_lock:
-                            capture_fps = value
+                        global capture_fps
+                        capture_fps = value
+                        print(f"[CAPTURE] Capture FPS set to: {value}")
+
                         # Also update camera FPS if USB
                         if usb_camera_cap and connection_mode == 'usb':
                             old_fps = usb_camera_cap.get(cv2.CAP_PROP_FPS)
@@ -1025,8 +1027,8 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                         return
 
                     elif setting == 'quality' and 10 <= value <= 100:
-                        with capture_settings_lock:
-                            jpeg_quality = value
+                        global jpeg_quality
+                        jpeg_quality = value
                         print(f"[CAPTURE] JPEG quality set to: {value}")
 
                         self.send_response(200)
@@ -1152,12 +1154,23 @@ def capture_usb():
     print(f"Camera controls available in web interface")
     print(f"Note: libjpeg warnings are harmless and can be ignored\n")
 
+    last_capture_time = time.time()
+
     while running:
+        # Enforce capture FPS limit
+        current_fps = capture_fps
+        if current_fps > 0:
+            frame_delay = 1.0 / current_fps
+            elapsed = time.time() - last_capture_time
+            if elapsed < frame_delay:
+                time.sleep(frame_delay - elapsed)
+
+        last_capture_time = time.time()
+
         ret, frame = cap.read()
         if ret:
             # Get current JPEG quality setting
-            with capture_settings_lock:
-                current_quality = jpeg_quality
+            current_quality = jpeg_quality
 
             # Fast OpenCV JPEG encoding with adjustable quality
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, current_quality]
@@ -1169,8 +1182,6 @@ def capture_usb():
                 with frame_lock:
                     current_frame = jpeg.tobytes()
                 frame_event.set()
-
-            # No sleep - let it run as fast as possible
         else:
             time.sleep(0.01)
 
