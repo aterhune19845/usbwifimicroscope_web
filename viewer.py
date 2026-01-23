@@ -48,6 +48,7 @@ processing_settings = {
     'brightness': 0,     # -100 to 100 (additive)
     'contrast': 1.0,     # 0.1 to 3.0 (multiplicative)
     'saturation': 1.0,   # 0.0 to 3.0
+    'gain': 1.0,         # 0.2 to 3.0 (software exposure/gain multiplier)
     'flip_h': True,      # Default flipped horizontal
     'flip_v': True,      # Default flipped vertical
     'rotate': 0,         # 0, 90, 180, 270
@@ -75,6 +76,8 @@ usb_camera_cap = None  # Global reference to camera
 # Capture settings
 capture_fps = 30  # Capture FPS (independent of stream FPS)
 jpeg_quality = 70  # JPEG encoding quality (1-100) - lower = faster encoding
+auto_exposure = True  # Auto exposure on/off
+exposure_value = -6  # Manual exposure value (typically -13 to 0, camera dependent)
 capture_settings_lock = threading.Lock()
 
 # Context manager to suppress libjpeg warnings
@@ -268,6 +271,10 @@ def apply_image_processing(frame):
             alpha=settings['contrast'],
             beta=settings['brightness']
         )
+
+    # 1.5 Apply gain (software exposure) if needed
+    if settings['gain'] != 1.0:
+        processed = cv2.convertScaleAbs(processed, alpha=settings['gain'], beta=0)
 
     # 2. Apply saturation (if needed)
     if settings['saturation'] != 1.0:
@@ -649,6 +656,10 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
 
             <div class="control-group">
                 <h3>Image Processing</h3>
+                <div class="slider-control">
+                    <label>Gain (Exposure): <span class="slider-value" id="gain-value">1.0</span></label>
+                    <input type="range" id="gain-slider" min="20" max="300" value="100" step="10">
+                </div>
                 <div class="slider-control">
                     <label>Brightness: <span class="slider-value" id="brightness-value">0</span></label>
                     <input type="range" id="brightness-slider" min="-100" max="100" value="0" step="1">
@@ -1046,6 +1057,18 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             img.src = '/stream.mjpg?fps=' + value + '&t=' + Date.now();
         });
 
+        // Gain (software exposure) slider
+        const gainSlider = document.getElementById('gain-slider');
+        const gainValue = document.getElementById('gain-value');
+
+        gainSlider.addEventListener('input', function() {
+            gainValue.textContent = (this.value / 100).toFixed(1);
+        });
+        gainSlider.addEventListener('change', function() {
+            fetch(`/process/gain/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set gain:', err));
+        });
+
         // Reset all settings
         function resetAll() {
             // Reset sliders to defaults
@@ -1057,6 +1080,8 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             saturationValue.textContent = '1.0';
             zoomSlider.value = 100;
             zoomValue.textContent = '100%';
+            gainSlider.value = 100;
+            gainValue.textContent = '1.0';
 
             fetch('/process/reset', { method: 'POST' })
                 .catch(err => console.error('Failed to reset:', err));
@@ -1326,6 +1351,7 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     processing_settings['brightness'] = 0
                     processing_settings['contrast'] = 1.0
                     processing_settings['saturation'] = 1.0
+                    processing_settings['gain'] = 1.0
                     processing_settings['flip_h'] = True
                     processing_settings['flip_v'] = True
                     processing_settings['rotate'] = 0
@@ -1385,6 +1411,12 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                         with processing_lock:
                             processing_settings['zoom'] = value
                         print(f"[{timestamp}] PYTHON: Received zoom={value:.2f}x, updated settings")
+
+                    elif setting == 'gain':
+                        value = int(value_str) / 100.0  # Convert 20-300 to 0.2-3.0
+                        with processing_lock:
+                            processing_settings['gain'] = value
+                        print(f"[{timestamp}] PYTHON: Received gain={value:.1f}x, updated settings")
 
                     elif setting == 'stabilize' and value_str == 'toggle':
                         with processing_lock:
@@ -1484,8 +1516,44 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                         self.end_headers()
                         self.wfile.write(b'{"status": "ok"}')
                         return
+
+                    elif setting == 'exposure' and -13 <= value <= 0:
+                        global exposure_value
+                        exposure_value = value
+                        # Apply to camera if available
+                        if usb_camera_cap is not None:
+                            usb_camera_cap.set(cv2.CAP_PROP_EXPOSURE, value)
+                        print(f"[CAPTURE] Exposure set to: {value}")
+
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(b'{"status": "ok"}')
+                        return
+
                 except:
                     pass
+
+            # Handle auto_exposure toggle (non-integer value)
+            if len(parts) == 4 and parts[2] == 'auto_exposure' and parts[3] == 'toggle':
+                global auto_exposure
+                auto_exposure = not auto_exposure
+                # Apply to camera if available
+                if usb_camera_cap is not None:
+                    if auto_exposure:
+                        # Enable auto exposure (value depends on camera, typically 3=auto, 1=manual)
+                        usb_camera_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+                    else:
+                        # Disable auto exposure and set manual value
+                        usb_camera_cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                        usb_camera_cap.set(cv2.CAP_PROP_EXPOSURE, exposure_value)
+                print(f"[CAPTURE] Auto exposure: {auto_exposure}")
+
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(f'{{"status": "ok", "enabled": {"true" if auto_exposure else "false"}}}'.encode())
+                return
 
             self.send_response(400)
             self.end_headers()
@@ -1528,8 +1596,16 @@ def capture_usb():
     # Set camera properties optimized for Raspberry Pi 3
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 15)
+    cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    # Print camera exposure capabilities for debugging
+    print(f"\n=== Camera Exposure Info ===")
+    print(f"  AUTO_EXPOSURE: {cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)}")
+    print(f"  EXPOSURE: {cap.get(cv2.CAP_PROP_EXPOSURE)}")
+    print(f"  BRIGHTNESS: {cap.get(cv2.CAP_PROP_BRIGHTNESS)}")
+    print(f"  GAIN: {cap.get(cv2.CAP_PROP_GAIN)}")
+    print(f"============================\n")
 
     print(f"Capturing from USB microscope...")
     print(f"All image processing done in Python - sliders affect image in real-time\n")
