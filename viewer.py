@@ -51,13 +51,29 @@ processing_settings = {
     'flip_h': True,      # Default flipped horizontal
     'flip_v': True,      # Default flipped vertical
     'rotate': 0,         # 0, 90, 180, 270
-    'zoom': 1.0          # 0.5 to 4.0
+    'zoom': 1.0,         # 0.5 to 4.0
+    'stabilize': False   # Image stabilization on/off
 }
 processing_lock = threading.Lock()
+
+# Stabilization state
+stabilization_state = {
+    'prev_gray': None,
+    'accumulated_x': 0.0,
+    'accumulated_y': 0.0,
+    'smooth_correction_x': 0.0,  # Smoothed output correction
+    'smooth_correction_y': 0.0,
+    'noise_threshold': 0.5,  # Ignore motion smaller than this (pixels)
+    'correction_smoothing': 0.3,  # Smooth the correction output (0=no smooth, 1=max smooth)
+    'decay': 0.6,  # How fast correction returns to center (lower=faster)
+    'frame_buffer': [],  # Buffer for frame blending
+    'blend_frames': 2  # Number of frames to blend (1=no blending, 2-4 for smoothing)
+}
+stabilization_lock = threading.Lock()
 usb_camera_cap = None  # Global reference to camera
 
 # Capture settings
-capture_fps = 15  # Capture FPS (independent of stream FPS) - reduce to 10 on Pi if slow
+capture_fps = 30  # Capture FPS (independent of stream FPS)
 jpeg_quality = 70  # JPEG encoding quality (1-100) - lower = faster encoding
 capture_settings_lock = threading.Lock()
 
@@ -73,6 +89,164 @@ class SuppressStderr:
         os.close(self.null_fd)
         os.close(self.save_fd)
 
+def apply_stabilization(frame):
+    """Apply image stabilization using phase correlation"""
+    global stabilization_state
+
+    h, w = frame.shape[:2]
+
+    # Convert to grayscale for motion detection
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # If this is the first frame, just store it
+    if stabilization_state['prev_gray'] is None:
+        with stabilization_lock:
+            stabilization_state['prev_gray'] = gray.copy()
+        # Draw indicator even on first frame
+        stabilized = frame.copy()
+        cv2.putText(stabilized, "STABILIZE: INIT", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        return stabilized
+
+    correction_x = 0.0
+    correction_y = 0.0
+    detected_dx = 0.0
+    detected_dy = 0.0
+
+    # Use phase correlation to detect shift between frames
+    try:
+        # Convert to float32 for phase correlation
+        prev_float = stabilization_state['prev_gray'].astype(np.float32)
+        curr_float = gray.astype(np.float32)
+
+        # Calculate phase correlation - returns how much curr shifted from prev
+        shift, response = cv2.phaseCorrelate(prev_float, curr_float)
+
+        dx, dy = shift
+        detected_dx, detected_dy = dx, dy
+
+        # Get settings
+        noise_threshold = stabilization_state['noise_threshold']
+        correction_smoothing = stabilization_state['correction_smoothing']
+
+        # Ignore small movements (noise)
+        if abs(dx) < noise_threshold:
+            dx = 0
+        if abs(dy) < noise_threshold:
+            dy = 0
+
+        # Only apply correction if the shift is reasonable (not too large)
+        max_shift = min(w, h) * 0.3
+        if abs(detected_dx) < max_shift and abs(detected_dy) < max_shift:
+            with stabilization_lock:
+                # Accumulate the total drift (sum of all frame-to-frame movements)
+                stabilization_state['accumulated_x'] += dx
+                stabilization_state['accumulated_y'] += dy
+
+                # Apply decay so it returns to center after intentional movements
+                decay = stabilization_state['decay']
+                stabilization_state['accumulated_x'] *= decay
+                stabilization_state['accumulated_y'] *= decay
+
+                # Limit maximum correction
+                max_accum = min(w, h) * 0.5
+                stabilization_state['accumulated_x'] = max(-max_accum, min(max_accum, stabilization_state['accumulated_x']))
+                stabilization_state['accumulated_y'] = max(-max_accum, min(max_accum, stabilization_state['accumulated_y']))
+
+                # The correction is the NEGATIVE of accumulated drift
+                raw_correction_x = -stabilization_state['accumulated_x']
+                raw_correction_y = -stabilization_state['accumulated_y']
+
+                # Smooth the correction output to reduce jitter
+                stabilization_state['smooth_correction_x'] = (
+                    correction_smoothing * stabilization_state['smooth_correction_x'] +
+                    (1 - correction_smoothing) * raw_correction_x
+                )
+                stabilization_state['smooth_correction_y'] = (
+                    correction_smoothing * stabilization_state['smooth_correction_y'] +
+                    (1 - correction_smoothing) * raw_correction_y
+                )
+
+                correction_x = stabilization_state['smooth_correction_x']
+                correction_y = stabilization_state['smooth_correction_y']
+
+            # Create transformation matrix - apply OPPOSITE of detected motion
+            M = np.float32([[1, 0, correction_x], [0, 1, correction_y]])
+
+            # Apply the transformation
+            stabilized = cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        else:
+            # Shift too large, probably scene change - reset
+            with stabilization_lock:
+                stabilization_state['accumulated_x'] = 0.0
+                stabilization_state['accumulated_y'] = 0.0
+                stabilization_state['smooth_correction_x'] = 0.0
+                stabilization_state['smooth_correction_y'] = 0.0
+                stabilization_state['frame_buffer'] = []  # Clear buffer on scene change
+            stabilized = frame.copy()
+
+    except Exception:
+        stabilized = frame.copy()
+
+    # Update previous frame
+    with stabilization_lock:
+        stabilization_state['prev_gray'] = gray.copy()
+
+    # Apply frame blending to reduce tearing artifacts
+    blend_count = stabilization_state['blend_frames']
+    if blend_count > 1:
+        with stabilization_lock:
+            # Add current frame to buffer
+            stabilization_state['frame_buffer'].append(stabilized.astype(np.float32))
+
+            # Keep only the last N frames
+            if len(stabilization_state['frame_buffer']) > blend_count:
+                stabilization_state['frame_buffer'] = stabilization_state['frame_buffer'][-blend_count:]
+
+            # Blend frames together (weighted average, newer frames get more weight)
+            if len(stabilization_state['frame_buffer']) >= 2:
+                blended = np.zeros_like(stabilized, dtype=np.float32)
+                total_weight = 0
+                for i, buf_frame in enumerate(stabilization_state['frame_buffer']):
+                    weight = i + 1  # Newer frames get higher weight
+                    blended += buf_frame * weight
+                    total_weight += weight
+                stabilized = (blended / total_weight).astype(np.uint8)
+
+    # Draw visual indicator showing stabilization is active
+    cv2.rectangle(stabilized, (5, 5), (250, 75), (0, 0, 0), -1)  # Black background
+    cv2.rectangle(stabilized, (5, 5), (250, 75), (0, 255, 0), 2)  # Green border
+    cv2.putText(stabilized, "STABILIZE: ON", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(stabilized, f"Motion: X:{detected_dx:+.1f} Y:{detected_dy:+.1f}", (10, 47),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(stabilized, f"Correction: X:{correction_x:+.1f} Y:{correction_y:+.1f}", (10, 67),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+    # Draw a small crosshair showing the correction vector (scaled up for visibility)
+    center_x, center_y = w - 50, 50
+    scale = 2  # Scale up the vector for visibility
+    end_x = int(center_x + correction_x * scale)
+    end_y = int(center_y + correction_y * scale)
+    cv2.circle(stabilized, (center_x, center_y), 25, (0, 255, 0), 1)  # Reference circle
+    cv2.line(stabilized, (center_x, center_y), (end_x, end_y), (0, 255, 255), 2)  # Correction vector
+    cv2.circle(stabilized, (end_x, end_y), 5, (0, 255, 255), -1)  # End point
+
+    return stabilized
+
+
+def reset_stabilization():
+    """Reset stabilization state (call when toggling off or scene changes)"""
+    global stabilization_state
+    with stabilization_lock:
+        stabilization_state['prev_gray'] = None
+        stabilization_state['accumulated_x'] = 0.0
+        stabilization_state['accumulated_y'] = 0.0
+        stabilization_state['smooth_correction_x'] = 0.0
+        stabilization_state['smooth_correction_y'] = 0.0
+        stabilization_state['frame_buffer'] = []
+
+
 def apply_image_processing(frame):
     """Apply all image processing in Python using OpenCV"""
     global processing_settings
@@ -82,6 +256,10 @@ def apply_image_processing(frame):
 
     # Start with original frame as uint8
     processed = frame
+
+    # 0. Apply stabilization first (if enabled)
+    if settings['stabilize']:
+        processed = apply_stabilization(processed)
 
     # 1. Apply brightness and contrast (if needed)
     if settings['brightness'] != 0 or settings['contrast'] != 1.0:
@@ -496,6 +674,34 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             </div>
 
             <div class="control-group">
+                <h3>Stabilization</h3>
+                <div class="button-group">
+                    <button id="stabilize-btn" onclick="toggleStabilize()">Stabilize: OFF</button>
+                </div>
+                <div id="stabilize-settings" style="display: none; margin-top: 10px;">
+                    <div class="slider-control">
+                        <label>Noise Filter: <span class="slider-value" id="stab-noise-value">0.5</span></label>
+                        <input type="range" id="stab-noise-slider" min="0" max="30" value="5" step="1">
+                    </div>
+                    <div class="slider-control">
+                        <label>Smoothing: <span class="slider-value" id="stab-smooth-value">0.3</span></label>
+                        <input type="range" id="stab-smooth-slider" min="0" max="90" value="30" step="5">
+                    </div>
+                    <div class="slider-control">
+                        <label>Decay: <span class="slider-value" id="stab-decay-value">0.6</span></label>
+                        <input type="range" id="stab-decay-slider" min="30" max="95" value="60" step="5">
+                    </div>
+                    <div class="slider-control">
+                        <label>Frame Blend: <span class="slider-value" id="stab-blend-value">2</span></label>
+                        <input type="range" id="stab-blend-slider" min="1" max="10" value="2" step="1">
+                    </div>
+                    <div class="button-group" style="margin-top: 10px;">
+                        <button onclick="resetStabilizeSettings()">Reset to Defaults</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="control-group">
                 <h3>Zoom</h3>
                 <div class="slider-control">
                     <label>Zoom Level: <span class="slider-value" id="zoom-value">100%</span></label>
@@ -510,8 +716,8 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             <div class="control-group">
                 <h3>Capture Settings</h3>
                 <div class="slider-control">
-                    <label>Capture FPS: <span class="slider-value" id="capture-fps-value">15</span></label>
-                    <input type="range" id="capture-fps-slider" min="1" max="30" value="15" step="1">
+                    <label>Capture FPS: <span class="slider-value" id="capture-fps-value">30</span></label>
+                    <input type="range" id="capture-fps-slider" min="1" max="30" value="30" step="1">
                 </div>
                 <div class="slider-control">
                     <label>JPEG Quality: <span class="slider-value" id="quality-value">75</span></label>
@@ -695,6 +901,83 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                     const ts = new Date().toISOString();
                     console.error(`[${ts}] BROWSER: Failed to flip vertical:`, err);
                 });
+        }
+
+        let stabilizeEnabled = false;
+        function toggleStabilize() {
+            fetch('/process/stabilize/toggle', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    stabilizeEnabled = data.enabled;
+                    document.getElementById('stabilize-btn').textContent =
+                        'Stabilize: ' + (stabilizeEnabled ? 'ON' : 'OFF');
+                    // Show/hide settings when stabilization is toggled
+                    document.getElementById('stabilize-settings').style.display =
+                        stabilizeEnabled ? 'block' : 'none';
+                })
+                .catch(err => console.error('Failed to toggle stabilize:', err));
+        }
+
+        // Stabilization settings sliders
+        const stabNoiseSlider = document.getElementById('stab-noise-slider');
+        const stabNoiseValue = document.getElementById('stab-noise-value');
+        const stabSmoothSlider = document.getElementById('stab-smooth-slider');
+        const stabSmoothValue = document.getElementById('stab-smooth-value');
+        const stabDecaySlider = document.getElementById('stab-decay-slider');
+        const stabDecayValue = document.getElementById('stab-decay-value');
+        const stabBlendSlider = document.getElementById('stab-blend-slider');
+        const stabBlendValue = document.getElementById('stab-blend-value');
+
+        stabNoiseSlider.addEventListener('input', function() {
+            const value = (this.value / 10).toFixed(1);
+            stabNoiseValue.textContent = value;
+        });
+        stabNoiseSlider.addEventListener('change', function() {
+            const value = this.value / 10;
+            fetch(`/process/stab_noise/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set noise threshold:', err));
+        });
+
+        stabSmoothSlider.addEventListener('input', function() {
+            const value = (this.value / 100).toFixed(2);
+            stabSmoothValue.textContent = value;
+        });
+        stabSmoothSlider.addEventListener('change', function() {
+            fetch(`/process/stab_smooth/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set smoothing:', err));
+        });
+
+        stabDecaySlider.addEventListener('input', function() {
+            const value = (this.value / 100).toFixed(2);
+            stabDecayValue.textContent = value;
+        });
+        stabDecaySlider.addEventListener('change', function() {
+            fetch(`/process/stab_decay/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set decay:', err));
+        });
+
+        stabBlendSlider.addEventListener('input', function() {
+            stabBlendValue.textContent = this.value;
+        });
+        stabBlendSlider.addEventListener('change', function() {
+            fetch(`/process/stab_blend/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set frame blend:', err));
+        });
+
+        function resetStabilizeSettings() {
+            // Reset sliders to default values
+            stabNoiseSlider.value = 5;
+            stabNoiseValue.textContent = '0.5';
+            stabSmoothSlider.value = 30;
+            stabSmoothValue.textContent = '0.30';
+            stabDecaySlider.value = 60;
+            stabDecayValue.textContent = '0.60';
+            stabBlendSlider.value = 2;
+            stabBlendValue.textContent = '2';
+
+            // Send reset request to server
+            fetch('/process/stab_reset/1', { method: 'POST' })
+                .catch(err => console.error('Failed to reset stabilization settings:', err));
         }
 
         // Rotation controls
@@ -917,6 +1200,8 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                 zoomIn();
             } else if (e.key === '-' || e.key === '_') {
                 zoomOut();
+            } else if (e.key === 't' || e.key === 'T') {
+                toggleStabilize();
             }
         });
     </script>
@@ -1100,6 +1385,59 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
                         with processing_lock:
                             processing_settings['zoom'] = value
                         print(f"[{timestamp}] PYTHON: Received zoom={value:.2f}x, updated settings")
+
+                    elif setting == 'stabilize' and value_str == 'toggle':
+                        with processing_lock:
+                            processing_settings['stabilize'] = not processing_settings['stabilize']
+                            new_state = processing_settings['stabilize']
+                        if not new_state:
+                            # Reset stabilization state when turning off
+                            reset_stabilization()
+                        print(f"[{timestamp}] PYTHON: Received stabilize toggle, new state={new_state}")
+                        # Return JSON with enabled state for UI update
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(f'{{"status": "ok", "enabled": {"true" if new_state else "false"}}}'.encode())
+                        return
+
+                    elif setting == 'stab_noise':
+                        value = int(value_str) / 10.0  # Convert 0-30 to 0.0-3.0
+                        with stabilization_lock:
+                            stabilization_state['noise_threshold'] = value
+                        print(f"[{timestamp}] PYTHON: Stabilization noise threshold={value:.1f}")
+
+                    elif setting == 'stab_smooth':
+                        value = int(value_str) / 100.0  # Convert 0-90 to 0.0-0.9
+                        with stabilization_lock:
+                            stabilization_state['correction_smoothing'] = value
+                        print(f"[{timestamp}] PYTHON: Stabilization smoothing={value:.2f}")
+
+                    elif setting == 'stab_decay':
+                        value = int(value_str) / 100.0  # Convert 30-95 to 0.3-0.95
+                        with stabilization_lock:
+                            stabilization_state['decay'] = value
+                        print(f"[{timestamp}] PYTHON: Stabilization decay={value:.2f}")
+
+                    elif setting == 'stab_blend':
+                        value = int(value_str)  # 1-5 frames
+                        with stabilization_lock:
+                            stabilization_state['blend_frames'] = value
+                            stabilization_state['frame_buffer'] = []  # Clear buffer when changing
+                        print(f"[{timestamp}] PYTHON: Stabilization frame blend={value}")
+
+                    elif setting == 'stab_reset':
+                        with stabilization_lock:
+                            stabilization_state['noise_threshold'] = 0.5
+                            stabilization_state['correction_smoothing'] = 0.3
+                            stabilization_state['decay'] = 0.6
+                            stabilization_state['blend_frames'] = 2
+                            stabilization_state['frame_buffer'] = []
+                            stabilization_state['accumulated_x'] = 0.0
+                            stabilization_state['accumulated_y'] = 0.0
+                            stabilization_state['smooth_correction_x'] = 0.0
+                            stabilization_state['smooth_correction_y'] = 0.0
+                        print(f"[{timestamp}] PYTHON: Stabilization settings reset to defaults")
 
                     else:
                         self.send_response(400)
@@ -1427,6 +1765,7 @@ def main():
     print("  Ctrl+R - Start/Stop recording")
     print("  H - Flip horizontal")
     print("  V - Flip vertical")
+    print("  T - Toggle stabilization")
     print("  R - Reset all settings")
     print("  +/- - Zoom in/out\n")
 
