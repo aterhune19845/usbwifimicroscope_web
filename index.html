@@ -355,16 +355,16 @@
                 </div>
                 <div id="stabilize-settings" style="display: none; margin-top: 10px;">
                     <div class="slider-control">
-                        <label>Noise Filter: <span class="slider-value" id="stab-noise-value">0.5</span></label>
-                        <input type="range" id="stab-noise-slider" min="0" max="30" value="5" step="1">
+                        <label>Noise Filter: <span class="slider-value" id="stab-noise-value">0.0</span></label>
+                        <input type="range" id="stab-noise-slider" min="0" max="30" value="0" step="1">
                     </div>
                     <div class="slider-control">
-                        <label>Smoothing: <span class="slider-value" id="stab-smooth-value">0.3</span></label>
-                        <input type="range" id="stab-smooth-slider" min="0" max="90" value="30" step="5">
+                        <label>Smoothing: <span class="slider-value" id="stab-smooth-value">0.00</span></label>
+                        <input type="range" id="stab-smooth-slider" min="0" max="90" value="0" step="5">
                     </div>
                     <div class="slider-control">
-                        <label>Decay: <span class="slider-value" id="stab-decay-value">0.6</span></label>
-                        <input type="range" id="stab-decay-slider" min="30" max="95" value="60" step="5">
+                        <label>Decay: <span class="slider-value" id="stab-decay-value">0.3</span></label>
+                        <input type="range" id="stab-decay-slider" min="30" max="95" value="30" step="5">
                     </div>
                     <div class="slider-control">
                         <label>Frame Blend: <span class="slider-value" id="stab-blend-value">4</span></label>
@@ -629,12 +629,12 @@
 
         function resetStabilizeSettings() {
             // Reset sliders to default values
-            stabNoiseSlider.value = 5;
-            stabNoiseValue.textContent = '0.5';
-            stabSmoothSlider.value = 30;
-            stabSmoothValue.textContent = '0.30';
-            stabDecaySlider.value = 60;
-            stabDecayValue.textContent = '0.60';
+            stabNoiseSlider.value = 0;
+            stabNoiseValue.textContent = '0.0';
+            stabSmoothSlider.value = 0;
+            stabSmoothValue.textContent = '0.00';
+            stabDecaySlider.value = 30;
+            stabDecayValue.textContent = '0.30';
             stabBlendSlider.value = 4;
             stabBlendValue.textContent = '4';
 

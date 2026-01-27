@@ -22,9 +22,9 @@ settings = {
     'rotate': 0,
     'zoom': 1.0,
     'stabilize': False,
-    'stab_noise': 5,
-    'stab_smooth': 30,
-    'stab_decay': 60,
+    'stab_noise': 0,
+    'stab_smooth': 0,
+    'stab_decay': 30,
     'stab_blend': 4,
     'jpeg_quality': 100,
     'capture_fps': 30,
@@ -319,8 +319,8 @@ class Handler(SimpleHTTPRequestHandler):
                         settings['stab_blend'] = int(value)
                     elif setting == 'stab_reset':
                         settings.update({
-                            'stab_noise': 5, 'stab_smooth': 30,
-                            'stab_decay': 60, 'stab_blend': 2
+                            'stab_noise': 0, 'stab_smooth': 0,
+                            'stab_decay': 30, 'stab_blend': 4
                         })
             
             self.send_response(200)
