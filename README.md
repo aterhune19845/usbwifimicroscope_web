@@ -208,3 +208,4 @@ Contributions welcome! Please open an issue or submit a pull request.
 - macOS may show Continuity Camera warning (harmless)
 - Some browsers may not support VP9 codec (falls back to VP8)
 - WiFi detection takes ~2 seconds on startup
+- **macOS USB Reconnection**: On macOS, when a USB microscope is disconnected and reconnected, the viewer will detect it as stale and require a manual restart. This is a limitation of OpenCV's AVFoundation backend. Linux and Windows do not have this issue.

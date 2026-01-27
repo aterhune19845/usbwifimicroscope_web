@@ -2,20 +2,13 @@
 import time
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-import os
-
-try:
-    import cv2
-    import numpy as np
-    USB_AVAILABLE = True
-except ImportError:
-    USB_AVAILABLE = False
-    print("OpenCV not available")
-    exit(1)
+import cv2
+import numpy as np
+import usb.core
+import usb.util
 
 WEB_PORT = 8080
 current_frame = None
-back_frame = None
 frame_lock = threading.Lock()
 running = True
 
@@ -169,46 +162,53 @@ def apply_processing(frame, s):
     
     return apply_stabilization(p, s)
 
-def find_device():
-    for i in range(10):
-        try:
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                cap.release()
-                if w == 1280 and h == 720:
-                    return i
-        except:
-            pass
-    return None
-
 def capture_loop():
-    global current_frame, back_frame, running
+    global current_frame, running
     
-    device_id = find_device()
-    if device_id is None:
-        print("No microscope found")
+    dev = usb.core.find(idVendor=0x1b3f, idProduct=0x2002)
+    if not dev:
+        print("Microscope not found (VID: 1b3f, PID: 2002)")
+        running = False
         return
     
-    cap = cv2.VideoCapture(device_id)
+    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
-    print(f"Connected to device {device_id}")
+    time.sleep(1)
+    
+    ret, frame = cap.read()
+    if not ret or frame.shape[1] != 1280 or frame.shape[0] != 720:
+        print("Failed to read from device")
+        cap.release()
+        running = False
+        return
+    
+    print(f"Web viewer running at: http://localhost:{WEB_PORT}")
+    print("Press Ctrl+C to stop\n")
     
     frame_count = 0
     last_time = time.time()
     cached_settings = None
     settings_check_count = 0
+    consecutive_failures = 0
     
     while running:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if frame_count > 0:
+            ret, frame = cap.read()
+            if not ret:
+                consecutive_failures += 1
+                if consecutive_failures > 10:
+                    print("Camera became stale")
+                    cap.release()
+                    running = False
+                    return
+                time.sleep(0.1)
+                continue
         
+        consecutive_failures = 0
         settings_check_count += 1
         if settings_check_count >= 10:
             with settings_lock:
@@ -223,16 +223,13 @@ def capture_loop():
         processed = apply_processing(frame, cached_settings)
         ret, jpeg = cv2.imencode('.jpg', processed, [cv2.IMWRITE_JPEG_QUALITY, cached_settings['jpeg_quality']])
         if ret:
-            back_frame = jpeg.tobytes()
             with frame_lock:
-                current_frame = back_frame
+                current_frame = jpeg.tobytes()
         
         if frame_count % 30 == 0:
             fps = 30 / (time.time() - last_time)
             print(f"Frame {frame_count}: {fps:.1f} fps")
             last_time = time.time()
-    
-    cap.release()
 
 class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -355,6 +352,7 @@ class Handler(SimpleHTTPRequestHandler):
         pass
 
 def main():
+    global running
     print("="*50)
     print("Microscope Viewer (Fast)")
     print("="*50)
@@ -365,13 +363,15 @@ def main():
     time.sleep(1)
     
     server = ThreadingHTTPServer(('', WEB_PORT), Handler)
-    print(f"Web viewer running at: http://localhost:{WEB_PORT}")
-    print("Press Ctrl+C to stop\n")
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
     
     try:
-        server.serve_forever()
+        while running:
+            time.sleep(0.1)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        pass
+    finally:
         running = False
         server.shutdown()
 
