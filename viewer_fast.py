@@ -139,12 +139,10 @@ def apply_processing(frame, s):
         p = cv2.flip(p, 0)
     
     r = int(s['rotate']) % 360
-    if r == 90:
-        p = cv2.rotate(p, cv2.ROTATE_90_CLOCKWISE)
-    elif r == 180:
-        p = cv2.rotate(p, cv2.ROTATE_180)
-    elif r == 270:
-        p = cv2.rotate(p, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if r != 0:
+        center = (p.shape[1] // 2, p.shape[0] // 2)
+        M = cv2.getRotationMatrix2D(center, r, 1.0)
+        p = cv2.warpAffine(p, M, (p.shape[1], p.shape[0]), borderMode=cv2.BORDER_REPLICATE)
     
     z = s['zoom']
     if z != 1.0:
@@ -224,6 +222,8 @@ def capture_loop():
                 cached_settings = settings.copy()
         
         frame_count += 1
+        if frame_count % 30 == 0:
+            print(f"Frame {frame_count}: rotate={cached_settings['rotate']}")
         processed = apply_processing(frame, cached_settings)
         ret, jpeg = cv2.imencode('.jpg', processed, [cv2.IMWRITE_JPEG_QUALITY, cached_settings['jpeg_quality']])
         if ret:
@@ -310,7 +310,9 @@ class Handler(SimpleHTTPRequestHandler):
                     elif setting == 'flip_v' and value == 'toggle':
                         settings['flip_v'] = not settings['flip_v']
                     elif setting == 'rotate':
-                        settings['rotate'] = (settings['rotate'] + int(value)) % 360
+                        new_rotate = int(value) % 360
+                        print(f"Setting rotate to {new_rotate}")
+                        settings['rotate'] = new_rotate
                     elif setting == 'stabilize' and value == 'toggle':
                         settings['stabilize'] = not settings['stabilize']
                     elif setting == 'stab_noise':

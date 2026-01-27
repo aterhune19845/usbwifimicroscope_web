@@ -194,7 +194,7 @@
             position: relative;
             max-width: 100%;
             max-height: 100%;
-            overflow: hidden;
+            overflow: visible;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -208,6 +208,7 @@
             background: #000;
             display: block;
             image-rendering: auto;
+            transition: transform 0.1s ease-out;
         }
         .info {
             position: absolute;
@@ -343,8 +344,10 @@
                 <div class="button-group">
                     <button onclick="flipHorizontal()">Flip H</button>
                     <button onclick="flipVertical()">Flip V</button>
-                    <button onclick="rotateLeft()">↶ 90°</button>
-                    <button onclick="rotateRight()">↷ 90°</button>
+                </div>
+                <div style="margin-top: 15px;">
+                    <label style="display: block; margin-bottom: 10px; font-size: 13px; color: #ccc;">Rotate: <span class="slider-value" id="rotate-value">0°</span></label>
+                    <canvas id="rotation-dial" width="200" height="200" style="width: 100%; max-width: 200px; display: block; margin: 0 auto; cursor: crosshair; border: 1px solid #333; border-radius: 6px; background: #1a1a1a;"></canvas>
                 </div>
             </div>
 
@@ -643,16 +646,94 @@
                 .catch(err => console.error('Failed to reset stabilization settings:', err));
         }
 
-        // Rotation controls
-        function rotateLeft() {
-            fetch('/process/rotate/-90', { method: 'POST' })
-                .catch(err => console.error('Failed to rotate:', err));
+        // Rotation dial
+        const canvas = document.getElementById('rotation-dial');
+        const ctx = canvas.getContext('2d');
+        const rotateValue = document.getElementById('rotate-value');
+        let currentRotation = 0;
+        let lastRotation = 0;
+        let isDragging = false;
+
+        function drawDial() {
+            const size = canvas.width;
+            const center = size / 2;
+            const radius = size / 2 - 10;
+
+            ctx.clearRect(0, 0, size, size);
+            ctx.fillStyle = '#1a1a1a';
+            ctx.fillRect(0, 0, size, size);
+
+            ctx.strokeStyle = '#444';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(center, center, radius, 0, Math.PI * 2);
+            ctx.stroke();
+
+            ctx.strokeStyle = '#666';
+            ctx.lineWidth = 1;
+            for (let i = 0; i < 12; i++) {
+                const angle = (i / 12) * Math.PI * 2 - Math.PI / 2;
+                const x1 = center + Math.cos(angle) * (radius - 5);
+                const y1 = center + Math.sin(angle) * (radius - 5);
+                const x2 = center + Math.cos(angle) * radius;
+                const y2 = center + Math.sin(angle) * radius;
+                ctx.beginPath();
+                ctx.moveTo(x1, y1);
+                ctx.lineTo(x2, y2);
+                ctx.stroke();
+            }
+
+            const angle = (currentRotation / 360) * Math.PI * 2 - Math.PI / 2;
+            const dotX = center + Math.cos(angle) * (radius - 15);
+            const dotY = center + Math.sin(angle) * (radius - 15);
+
+            ctx.fillStyle = '#0066cc';
+            ctx.beginPath();
+            ctx.arc(dotX, dotY, 6, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = '#0066cc';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(center, center);
+            ctx.lineTo(dotX, dotY);
+            ctx.stroke();
         }
 
-        function rotateRight() {
-            fetch('/process/rotate/90', { method: 'POST' })
-                .catch(err => console.error('Failed to rotate:', err));
+        function updateRotation(e) {
+            const rect = canvas.getBoundingClientRect();
+            const centerX = rect.width / 2;
+            const centerY = rect.height / 2;
+            const x = e.clientX - rect.left - centerX;
+            const y = e.clientY - rect.top - centerY;
+            let angle = Math.atan2(y, x) * 180 / Math.PI + 90;
+            if (angle < 0) angle += 360;
+            angle = Math.round(angle);
+            
+            // Detect wraparound and adjust currentRotation
+            const diff = angle - (lastRotation % 360);
+            if (diff > 180) {
+                currentRotation -= 360;
+            } else if (diff < -180) {
+                currentRotation += 360;
+            }
+            currentRotation += diff;
+            
+            lastRotation = angle;
+            rotateValue.textContent = (currentRotation % 360 + 360) % 360 + '°';
+            drawDial();
+            img.style.transform = `rotate(${currentRotation}deg)`;
         }
+
+        canvas.addEventListener('mousedown', () => { isDragging = true; });
+        canvas.addEventListener('mousemove', (e) => { if (isDragging) updateRotation(e); });
+        canvas.addEventListener('mouseup', () => { isDragging = false; });
+        canvas.addEventListener('touchstart', () => { isDragging = true; });
+        canvas.addEventListener('touchmove', (e) => { if (isDragging) updateRotation(e.touches[0]); });
+        canvas.addEventListener('touchend', () => { isDragging = false; });
+        canvas.addEventListener('click', updateRotation);
+
+        drawDial();
 
         // Zoom controls
         zoomSlider.addEventListener('input', function() {
