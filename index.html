@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Microscope Viewer</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            margin: 0;
+            padding: 0;
+            background: #1a1a1a;
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            -webkit-tap-highlight-color: transparent;
+            -webkit-touch-callout: none;
+            touch-action: manipulation;
+        }
+        .container {
+            display: flex;
+            height: 100vh;
+            height: 100dvh;
+        }
+        .sidebar {
+            width: 280px;
+            background: #252525;
+            padding: 20px;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            border-right: 1px solid #333;
+            transition: transform 0.3s ease;
+        }
+        .sidebar.mobile-hidden {
+            transform: translateX(-100%);
+        }
+        .mobile-toggle {
+            display: none;
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 1000;
+            background: #252525;
+            border: 1px solid #444;
+            color: #fff;
+            padding: 12px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            -webkit-user-select: none;
+            user-select: none;
+        }
+        .mobile-toggle:active {
+            background: #1a1a1a;
+        }
+        .mobile-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 998;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        .mobile-overlay.active {
+            opacity: 1;
+        }
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            overflow: hidden;
+        }
+        h1 {
+            margin: 0 0 30px 0;
+            font-size: 20px;
+            font-weight: 600;
+            color: #fff;
+        }
+        .control-group {
+            margin-bottom: 25px;
+        }
+        .control-group h3 {
+            margin: 0 0 12px 0;
+            font-size: 13px;
+            font-weight: 600;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .button-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        button {
+            background: #333;
+            border: 1px solid #444;
+            color: #fff;
+            padding: 10px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+        button:hover {
+            background: #3a3a3a;
+            border-color: #555;
+        }
+        button:active {
+            background: #2a2a2a;
+        }
+        button.primary {
+            background: #0066cc;
+            border-color: #0066cc;
+            grid-column: 1 / -1;
+        }
+        button.primary:hover {
+            background: #0077ee;
+        }
+        .slider-control {
+            margin-bottom: 15px;
+        }
+        .slider-control label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 13px;
+            color: #ccc;
+        }
+        .slider-control input[type="range"] {
+            width: 100%;
+            height: 6px;
+            border-radius: 3px;
+            background: #333;
+            outline: none;
+            -webkit-appearance: none;
+        }
+        .slider-control input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #0066cc;
+            cursor: pointer;
+        }
+        .slider-control input[type="range"]::-moz-range-thumb {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #0066cc;
+            cursor: pointer;
+            border: none;
+        }
+        .slider-value {
+            display: inline-block;
+            margin-left: 8px;
+            color: #0066cc;
+            font-weight: 600;
+        }
+        select {
+            width: 100%;
+            background: #333;
+            border: 1px solid #444;
+            color: #fff;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        select:hover {
+            border-color: #555;
+        }
+        .image-container {
+            position: relative;
+            width: calc(100vw - 280px - 40px);
+            height: calc(100vh - 40px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .image-wrapper {
+            position: relative;
+            max-width: 100%;
+            max-height: 100%;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #microscope-image {
+            max-width: 100%;
+            max-height: 100%;
+            width: auto;
+            height: auto;
+            border: 2px solid #333;
+            background: #000;
+            display: block;
+            image-rendering: auto;
+        }
+        .info {
+            position: absolute;
+            bottom: 30px;
+            right: 30px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            color: #aaa;
+        }
+        .fps {
+            color: #0066cc;
+            font-weight: 600;
+        }
+
+        @media (min-width: 1025px) {
+            .sidebar.mobile-hidden {
+                transform: none;
+            }
+            .mobile-overlay {
+                display: none !important;
+            }
+        }
+
+        @media (max-width: 1024px) {
+            .container {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 280px;
+                height: 100vh;
+                height: 100dvh;
+                z-index: 999;
+                box-shadow: 2px 0 10px rgba(0,0,0,0.5);
+            }
+
+            .mobile-toggle {
+                display: block;
+            }
+
+            .main-content {
+                width: 100%;
+                padding: 10px;
+                padding-top: 50px;
+            }
+
+            .image-container {
+                width: 100%;
+                height: calc(100vh - 60px);
+                height: calc(100dvh - 60px);
+            }
+
+            .info {
+                bottom: 10px;
+                right: 10px;
+                font-size: 10px;
+                padding: 6px 10px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .sidebar {
+                width: 100%;
+                max-width: 320px;
+            }
+
+            h1 {
+                font-size: 18px;
+                margin-bottom: 20px;
+            }
+
+            .control-group h3 {
+                font-size: 12px;
+            }
+
+            button {
+                padding: 12px 14px;
+                font-size: 14px;
+                -webkit-tap-highlight-color: transparent;
+            }
+
+            .slider-control label {
+                font-size: 12px;
+            }
+        }
+
+        @media (hover: none) and (pointer: coarse) {
+            button {
+                min-height: 44px;
+            }
+
+            input[type="range"] {
+                height: 44px;
+                padding: 10px 0;
+            }
+        }
+    </style>
+</head>
+<body>
+    <button class="mobile-toggle" id="mobile-toggle" onclick="toggleSidebar()">☰ Controls</button>
+    <div class="mobile-overlay" id="mobile-overlay" onclick="closeSidebar()"></div>
+    <div class="container">
+        <div class="sidebar" id="sidebar">
+            <h1>Microscope Controls</h1>
+
+            <div class="control-group">
+                <h3>Image Processing</h3>
+                <div class="slider-control">
+                    <label>Gain (Exposure): <span class="slider-value" id="gain-value">1.0</span></label>
+                    <input type="range" id="gain-slider" min="20" max="300" value="100" step="10">
+                </div>
+                <div class="slider-control">
+                    <label>Brightness: <span class="slider-value" id="brightness-value">0</span></label>
+                    <input type="range" id="brightness-slider" min="-100" max="100" value="0" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>Contrast: <span class="slider-value" id="contrast-value">1.0</span></label>
+                    <input type="range" id="contrast-slider" min="10" max="300" value="100" step="1">
+                </div>
+                <div class="slider-control">
+                    <label>Saturation: <span class="slider-value" id="saturation-value">1.0</span></label>
+                    <input type="range" id="saturation-slider" min="0" max="300" value="100" step="1">
+                </div>
+            </div>
+
+            <div class="control-group">
+                <h3>Orientation</h3>
+                <div class="button-group">
+                    <button onclick="flipHorizontal()">Flip H</button>
+                    <button onclick="flipVertical()">Flip V</button>
+                    <button onclick="rotateLeft()">↶ 90°</button>
+                    <button onclick="rotateRight()">↷ 90°</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <h3>Stabilization</h3>
+                <div class="button-group">
+                    <button id="stabilize-btn" onclick="toggleStabilize()">Stabilize: OFF</button>
+                </div>
+                <div id="stabilize-settings" style="display: none; margin-top: 10px;">
+                    <div class="slider-control">
+                        <label>Noise Filter: <span class="slider-value" id="stab-noise-value">0.5</span></label>
+                        <input type="range" id="stab-noise-slider" min="0" max="30" value="5" step="1">
+                    </div>
+                    <div class="slider-control">
+                        <label>Smoothing: <span class="slider-value" id="stab-smooth-value">0.3</span></label>
+                        <input type="range" id="stab-smooth-slider" min="0" max="90" value="30" step="5">
+                    </div>
+                    <div class="slider-control">
+                        <label>Decay: <span class="slider-value" id="stab-decay-value">0.6</span></label>
+                        <input type="range" id="stab-decay-slider" min="30" max="95" value="60" step="5">
+                    </div>
+                    <div class="slider-control">
+                        <label>Frame Blend: <span class="slider-value" id="stab-blend-value">4</span></label>
+                        <input type="range" id="stab-blend-slider" min="1" max="10" value="4" step="1">
+                    </div>
+                    <div class="button-group" style="margin-top: 10px;">
+                        <button onclick="resetStabilizeSettings()">Reset to Defaults</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <h3>Zoom</h3>
+                <div class="slider-control">
+                    <label>Zoom Level: <span class="slider-value" id="zoom-value">100%</span></label>
+                    <input type="range" id="zoom-slider" min="50" max="400" value="100" step="10">
+                </div>
+                <div class="button-group">
+                    <button onclick="zoomIn()">Zoom In</button>
+                    <button onclick="zoomOut()">Zoom Out</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <h3>Capture Settings</h3>
+                <div class="slider-control">
+                    <label>JPEG Quality: <span class="slider-value" id="quality-value">100</span></label>
+                    <input type="range" id="quality-slider" min="10" max="100" value="100" step="5">
+                </div>
+            </div>
+
+            <div class="control-group">
+                <h3>Reset</h3>
+                <button class="primary" onclick="resetAll()">Reset All Settings</button>
+            </div>
+
+            <div class="control-group">
+                <h3>Capture</h3>
+                <button class="primary" onclick="takeScreenshot()">📸 Take Screenshot</button>
+                <button class="primary" id="record-btn" onclick="toggleRecording()">⏺ Start Recording</button>
+                <div id="recording-status" style="display: none; margin-top: 10px; text-align: center; color: #ff4444; font-weight: 600;">
+                    ⏺ Recording: <span id="recording-time">0:00</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="image-container">
+                <div class="image-wrapper">
+                    <img id="microscope-image" src="/stream.mjpg" alt="Microscope feed">
+                </div>
+                <div class="info">
+                    Processed in Python • <span class="fps" id="actual-fps">-- FPS</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const img = document.getElementById('microscope-image');
+        const zoomSlider = document.getElementById('zoom-slider');
+        const zoomValue = document.getElementById('zoom-value');
+        const actualFpsDisplay = document.getElementById('actual-fps');
+        const sidebar = document.getElementById('sidebar');
+        const mobileToggle = document.getElementById('mobile-toggle');
+        const mobileOverlay = document.getElementById('mobile-overlay');
+
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
+
+        // Mobile sidebar toggle
+        function toggleSidebar() {
+            const isHidden = sidebar.classList.toggle('mobile-hidden');
+            if (window.innerWidth <= 1024) {
+                mobileOverlay.style.display = isHidden ? 'none' : 'block';
+                setTimeout(() => {
+                    mobileOverlay.classList.toggle('active', !isHidden);
+                }, 10);
+            }
+        }
+
+        function closeSidebar() {
+            sidebar.classList.add('mobile-hidden');
+            mobileOverlay.classList.remove('active');
+            setTimeout(() => {
+                mobileOverlay.style.display = 'none';
+            }, 300);
+        }
+
+        function handleResize() {
+            if (window.innerWidth <= 1024) {
+                if (!sidebar.classList.contains('mobile-hidden')) {
+                    closeSidebar();
+                }
+            } else {
+                sidebar.classList.remove('mobile-hidden');
+                mobileOverlay.style.display = 'none';
+                mobileOverlay.classList.remove('active');
+            }
+        }
+
+        handleResize();
+
+        let resizeTimeout;
+        window.addEventListener('resize', function() {
+            clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(handleResize, 100);
+        });
+
+        // Track actual FPS
+        img.addEventListener('load', function() {
+            frameCount++;
+            const now = Date.now();
+
+            // Debug every 30 frames
+            if (frameCount % 30 === 0) {
+                const timestamp = new Date().toISOString();
+                console.log(`[${timestamp}] BROWSER: Received and displayed frame ${frameCount}`);
+            }
+
+            if (now - lastFpsUpdate >= 1000) {
+                actualFpsDisplay.textContent = frameCount + ' FPS';
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
+        });
+
+        // Brightness slider
+        const brightnessSlider = document.getElementById('brightness-slider');
+        const brightnessValue = document.getElementById('brightness-value');
+        brightnessSlider.addEventListener('input', function() {
+            brightnessValue.textContent = this.value;
+        });
+        brightnessSlider.addEventListener('change', function() {
+            const value = this.value;
+            const timestamp = new Date().toISOString();
+            console.log(`[${timestamp}] BROWSER: Sending brightness=${value} to server`);
+            fetch(`/process/brightness/${value}`, { method: 'POST' })
+                .then(response => {
+                    const ts = new Date().toISOString();
+                    console.log(`[${ts}] BROWSER: Server responded OK to brightness change`);
+                })
+                .catch(err => {
+                    const ts = new Date().toISOString();
+                    console.error(`[${ts}] BROWSER: Failed to set brightness:`, err);
+                });
+        });
+
+        // Contrast slider (display as 0.1-3.0, send as 10-300)
+        const contrastSlider = document.getElementById('contrast-slider');
+        const contrastValue = document.getElementById('contrast-value');
+        contrastSlider.addEventListener('input', function() {
+            const displayValue = (this.value / 100).toFixed(1);
+            contrastValue.textContent = displayValue;
+        });
+        contrastSlider.addEventListener('change', function() {
+            const value = this.value;
+            fetch(`/process/contrast/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set contrast:', err));
+        });
+
+        // Saturation slider (display as 0.0-3.0, send as 0-300)
+        const saturationSlider = document.getElementById('saturation-slider');
+        const saturationValue = document.getElementById('saturation-value');
+        saturationSlider.addEventListener('input', function() {
+            const displayValue = (this.value / 100).toFixed(1);
+            saturationValue.textContent = displayValue;
+        });
+        saturationSlider.addEventListener('change', function() {
+            const value = this.value;
+            fetch(`/process/saturation/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set saturation:', err));
+        });
+
+        // Flip controls
+        function flipHorizontal() {
+            const timestamp = new Date().toISOString();
+            console.log(`[${timestamp}] BROWSER: Sending flip_h toggle to server`);
+            fetch('/process/flip_h/toggle', { method: 'POST' })
+                .then(response => {
+                    const ts = new Date().toISOString();
+                    console.log(`[${ts}] BROWSER: Server responded OK to flip_h`);
+                })
+                .catch(err => {
+                    const ts = new Date().toISOString();
+                    console.error(`[${ts}] BROWSER: Failed to flip horizontal:`, err);
+                });
+        }
+
+        function flipVertical() {
+            const timestamp = new Date().toISOString();
+            console.log(`[${timestamp}] BROWSER: Sending flip_v toggle to server`);
+            fetch('/process/flip_v/toggle', { method: 'POST' })
+                .then(response => {
+                    const ts = new Date().toISOString();
+                    console.log(`[${ts}] BROWSER: Server responded OK to flip_v`);
+                })
+                .catch(err => {
+                    const ts = new Date().toISOString();
+                    console.error(`[${ts}] BROWSER: Failed to flip vertical:`, err);
+                });
+        }
+
+        let stabilizeEnabled = false;
+        function toggleStabilize() {
+            fetch('/process/stabilize/toggle', { method: 'POST' })
+                .then(response => {
+                    stabilizeEnabled = !stabilizeEnabled;
+                    document.getElementById('stabilize-btn').textContent =
+                        'Stabilize: ' + (stabilizeEnabled ? 'ON' : 'OFF');
+                    document.getElementById('stabilize-settings').style.display =
+                        stabilizeEnabled ? 'block' : 'none';
+                })
+                .catch(err => console.error('Failed to toggle stabilize:', err));
+        }
+
+        // Stabilization settings sliders
+        const stabNoiseSlider = document.getElementById('stab-noise-slider');
+        const stabNoiseValue = document.getElementById('stab-noise-value');
+        const stabSmoothSlider = document.getElementById('stab-smooth-slider');
+        const stabSmoothValue = document.getElementById('stab-smooth-value');
+        const stabDecaySlider = document.getElementById('stab-decay-slider');
+        const stabDecayValue = document.getElementById('stab-decay-value');
+        const stabBlendSlider = document.getElementById('stab-blend-slider');
+        const stabBlendValue = document.getElementById('stab-blend-value');
+
+        stabNoiseSlider.addEventListener('input', function() {
+            const value = (this.value / 10).toFixed(1);
+            stabNoiseValue.textContent = value;
+        });
+        stabNoiseSlider.addEventListener('change', function() {
+            const value = this.value / 10;
+            fetch(`/process/stab_noise/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set noise threshold:', err));
+        });
+
+        stabSmoothSlider.addEventListener('input', function() {
+            const value = (this.value / 100).toFixed(2);
+            stabSmoothValue.textContent = value;
+        });
+        stabSmoothSlider.addEventListener('change', function() {
+            fetch(`/process/stab_smooth/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set smoothing:', err));
+        });
+
+        stabDecaySlider.addEventListener('input', function() {
+            const value = (this.value / 100).toFixed(2);
+            stabDecayValue.textContent = value;
+        });
+        stabDecaySlider.addEventListener('change', function() {
+            fetch(`/process/stab_decay/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set decay:', err));
+        });
+
+        stabBlendSlider.addEventListener('input', function() {
+            stabBlendValue.textContent = this.value;
+        });
+        stabBlendSlider.addEventListener('change', function() {
+            fetch(`/process/stab_blend/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set frame blend:', err));
+        });
+
+        function resetStabilizeSettings() {
+            // Reset sliders to default values
+            stabNoiseSlider.value = 5;
+            stabNoiseValue.textContent = '0.5';
+            stabSmoothSlider.value = 30;
+            stabSmoothValue.textContent = '0.30';
+            stabDecaySlider.value = 60;
+            stabDecayValue.textContent = '0.60';
+            stabBlendSlider.value = 4;
+            stabBlendValue.textContent = '4';
+
+            // Send reset request to server
+            fetch('/process/stab_reset/1', { method: 'POST' })
+                .catch(err => console.error('Failed to reset stabilization settings:', err));
+        }
+
+        // Rotation controls
+        function rotateLeft() {
+            fetch('/process/rotate/-90', { method: 'POST' })
+                .catch(err => console.error('Failed to rotate:', err));
+        }
+
+        function rotateRight() {
+            fetch('/process/rotate/90', { method: 'POST' })
+                .catch(err => console.error('Failed to rotate:', err));
+        }
+
+        // Zoom controls
+        zoomSlider.addEventListener('input', function() {
+            zoomValue.textContent = this.value + '%';
+        });
+        zoomSlider.addEventListener('change', function() {
+            const value = this.value;
+            fetch(`/process/zoom/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set zoom:', err));
+        });
+
+        function zoomIn() {
+            const currentZoom = parseInt(zoomSlider.value);
+            zoomSlider.value = Math.min(400, currentZoom + 25);
+            zoomSlider.dispatchEvent(new Event('input'));
+            zoomSlider.dispatchEvent(new Event('change'));
+        }
+
+        function zoomOut() {
+            const currentZoom = parseInt(zoomSlider.value);
+            zoomSlider.value = Math.max(50, currentZoom - 25);
+            zoomSlider.dispatchEvent(new Event('input'));
+            zoomSlider.dispatchEvent(new Event('change'));
+        }
+
+
+
+        // JPEG quality slider
+        const qualitySlider = document.getElementById('quality-slider');
+        const qualityValue = document.getElementById('quality-value');
+        qualitySlider.addEventListener('input', function() {
+            qualityValue.textContent = this.value;
+        });
+        qualitySlider.addEventListener('change', function() {
+            const value = this.value;
+            fetch(`/capture/quality/${value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set JPEG quality:', err));
+        });
+
+
+
+        // Gain (software exposure) slider
+        const gainSlider = document.getElementById('gain-slider');
+        const gainValue = document.getElementById('gain-value');
+
+        gainSlider.addEventListener('input', function() {
+            gainValue.textContent = (this.value / 100).toFixed(1);
+        });
+        gainSlider.addEventListener('change', function() {
+            fetch(`/process/gain/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set gain:', err));
+        });
+
+        // Reset all settings
+        function resetAll() {
+            // Reset sliders to defaults
+            brightnessSlider.value = 0;
+            brightnessValue.textContent = '0';
+            contrastSlider.value = 100;
+            contrastValue.textContent = '1.0';
+            saturationSlider.value = 100;
+            saturationValue.textContent = '1.0';
+            zoomSlider.value = 100;
+            zoomValue.textContent = '100%';
+            gainSlider.value = 100;
+            gainValue.textContent = '1.0';
+
+            fetch('/process/reset', { method: 'POST' })
+                .catch(err => console.error('Failed to reset:', err));
+        }
+
+        function takeScreenshot() {
+            // Fetch current processed frame from server
+            fetch('/current.jpg')
+                .then(response => response.blob())
+                .then(blob => {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+                    a.download = `microscope_${timestamp}.jpg`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                })
+                .catch(err => console.error('Failed to take screenshot:', err));
+        }
+
+        // Video recording functionality
+        let mediaRecorder = null;
+        let recordedChunks = [];
+        let recordingStartTime = null;
+        let recordingInterval = null;
+
+        function toggleRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        }
+
+        async function startRecording() {
+            try {
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+
+                const stream = canvas.captureStream(29);
+
+                let animationId;
+                function drawFrame() {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.drawImage(img, 0, 0);
+
+                    if (mediaRecorder && mediaRecorder.state === 'recording') {
+                        animationId = requestAnimationFrame(drawFrame);
+                    }
+                }
+
+                recordedChunks = [];
+                const options = {
+                    mimeType: 'video/webm;codecs=vp9',
+                    videoBitsPerSecond: 8000000
+                };
+
+                if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                    options.mimeType = 'video/webm;codecs=vp8';
+                }
+
+                mediaRecorder = new MediaRecorder(stream, options);
+
+                mediaRecorder.ondataavailable = function(e) {
+                    if (e.data.size > 0) {
+                        recordedChunks.push(e.data);
+                    }
+                };
+
+                mediaRecorder.onstop = function() {
+                    const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+                    a.download = `microscope_video_${timestamp}.webm`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+
+                    cancelAnimationFrame(animationId);
+                };
+
+                mediaRecorder.start(1000);
+                drawFrame();
+
+                document.getElementById('record-btn').textContent = '⏹ Stop Recording';
+                document.getElementById('recording-status').style.display = 'block';
+
+                recordingStartTime = Date.now();
+                recordingInterval = setInterval(updateRecordingTime, 1000);
+
+            } catch (err) {
+                console.error('Error starting recording:', err);
+                alert('Failed to start recording: ' + err.message);
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+
+                document.getElementById('record-btn').textContent = '⏺ Start Recording';
+                document.getElementById('recording-status').style.display = 'none';
+
+                if (recordingInterval) {
+                    clearInterval(recordingInterval);
+                    recordingInterval = null;
+                }
+            }
+        }
+
+        function updateRecordingTime() {
+            if (recordingStartTime) {
+                const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+                const minutes = Math.floor(elapsed / 60);
+                const seconds = elapsed % 60;
+                document.getElementById('recording-time').textContent =
+                    `${minutes}:${seconds.toString().padStart(2, '0')}`;
+            }
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 's' || e.key === 'S') {
+                takeScreenshot();
+            } else if (e.key === 'r' || e.key === 'R') {
+                if (e.ctrlKey || e.metaKey) {
+                    toggleRecording();
+                } else {
+                    resetAll();
+                }
+            } else if (e.key === 'h' || e.key === 'H') {
+                flipHorizontal();
+            } else if (e.key === 'v' || e.key === 'V') {
+                flipVertical();
+            } else if (e.key === '+' || e.key === '=') {
+                zoomIn();
+            } else if (e.key === '-' || e.key === '_') {
+                zoomOut();
+            } else if (e.key === 't' || e.key === 'T') {
+                toggleStabilize();
+            }
+        });
+    </script>
+</body>
+</html>
