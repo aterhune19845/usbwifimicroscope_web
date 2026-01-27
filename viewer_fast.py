@@ -53,10 +53,11 @@ def apply_stabilization(frame, s):
     
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray_small = cv2.resize(gray, (640, 360))
+    gray_small = cv2.resize(gray, (int(w/2), int(h/2)))
     
-    if stab_prev_gray is None:
+    if stab_prev_gray is None or stab_prev_gray.shape != gray_small.shape:
         stab_prev_gray = gray_small.copy()
+        stab_frame_buffer = []
         return frame
     
     try:
@@ -114,6 +115,9 @@ def apply_stabilization(frame, s):
     return stabilized
 
 def apply_processing(frame, s):
+    global stab_prev_gray, stab_accumulated_x, stab_accumulated_y
+    global stab_smooth_correction_x, stab_smooth_correction_y, stab_frame_buffer
+    
     p = frame
     
     if s['brightness'] != 0 or s['contrast'] != 1.0:
