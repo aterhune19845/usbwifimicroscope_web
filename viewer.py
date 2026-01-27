@@ -21,7 +21,12 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-# Try to import OpenCV for USB camera support
+try:
+    import usb.core
+    USB_ID_AVAILABLE = True
+except ImportError:
+    USB_ID_AVAILABLE = False
+
 try:
     import cv2
     import numpy as np
@@ -42,6 +47,11 @@ frame_event = threading.Event()
 running = True
 target_fps = 29  # Default target FPS for streaming
 connection_mode = None  # Will be 'wifi', 'usb', or None
+microscope_connected = False  # Track connection status
+
+# Microscope USB identifiers (VID/PID for GENERAL - UVC microscope)
+MICROSCOPE_VID = 0x1b3f
+MICROSCOPE_PID = 0x2002
 
 # Image processing settings (all processing happens in Python)
 processing_settings = {
@@ -1563,39 +1573,79 @@ class MicroscopeHandler(SimpleHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, fmt, *arguments):
-        # Suppress logging
         pass
+
+def create_black_frame():
+    if USB_AVAILABLE:
+        black = np.zeros((720, 1280, 3), dtype=np.uint8)
+        ret, jpeg = cv2.imencode('.jpg', black, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        if ret:
+            return jpeg.tobytes()
+    return None
+
+def find_microscope_device():
+    """Find microscope device - native 1280x720 resolution"""
+    if not USB_AVAILABLE:
+        return None
+    try:
+        # Just scan for 1280x720 device without system_profiler check
+        for device_id in range(10):
+            try:
+                cap = cv2.VideoCapture(device_id)
+                if cap.isOpened():
+                    native_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    native_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    cap.release()
+                    if native_w == 1280 and native_h == 720:
+                        return device_id
+            except:
+                pass
+    except:
+        pass
+    return None
 
 def capture_usb():
     """Capture frames from USB microscope and apply processing"""
-    global current_frame, running, connection_mode, usb_camera_cap
+    global current_frame, running, connection_mode, usb_camera_cap, microscope_connected, current_frame_number
 
     if not USB_AVAILABLE:
         print("ERROR: OpenCV not available for USB capture")
         return
 
-    print("Attempting to connect to USB microscope...")
-
-    # Try to open the USB camera
-    cap = None
-    for device_id in range(5):
-        cap = cv2.VideoCapture(device_id)
-        if cap.isOpened():
-            print(f"Found USB microscope on device {device_id}")
-            connection_mode = 'usb'
-            break
-        cap.release()
-        cap = None
-
-    if not cap or not cap.isOpened():
+    print("Finding USB microscope (VID:0x1b3f PID:0x2002)...")
+    device_id = find_microscope_device()
+    if device_id is None:
         print("No USB microscope found")
+        microscope_connected = False
+        black_frame = create_black_frame()
+        if black_frame:
+            with frame_lock:
+                current_frame = black_frame
+                current_frame_number += 1
+            frame_event.set()
         return
+    
+    print(f"Found microscope on device {device_id}")
+    cap = cv2.VideoCapture(device_id)
+    if not cap.isOpened():
+        print("Failed to open microscope")
+        microscope_connected = False
+        black_frame = create_black_frame()
+        if black_frame:
+            with frame_lock:
+                current_frame = black_frame
+                current_frame_number += 1
+            frame_event.set()
+        return
+    
+    connection_mode = 'usb'
+    microscope_connected = True
 
     usb_camera_cap = cap
 
     # Set camera properties optimized for Raspberry Pi 3
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -1614,6 +1664,9 @@ def capture_usb():
     frame_counter = 0
     last_debug_time = time.time()
 
+    consecutive_failures = 0
+    max_failures = 30  # Wait longer before giving up (3 seconds at 10 fps)
+    
     while running:
         # Read capture settings
         global capture_fps, jpeg_quality
@@ -1633,6 +1686,11 @@ def capture_usb():
 
         ret, frame = cap.read()
         if ret:
+            consecutive_failures = 0
+            if not microscope_connected:
+                print("✓ USB microscope reconnected")
+                microscope_connected = True
+            
             frame_counter += 1
 
             # Debug every 30 frames
@@ -1654,7 +1712,6 @@ def capture_usb():
                 ret, jpeg = cv2.imencode('.jpg', processed_frame, encode_params)
 
             if ret:
-                global current_frame_number
                 new_frame = jpeg.tobytes()
                 with frame_lock:
                     current_frame = new_frame
@@ -1666,14 +1723,33 @@ def capture_usb():
                     timestamp = datetime.now().isoformat()
                     print(f"[{timestamp}] PYTHON CAPTURE: Encoded and stored frame_num={frame_num}")
         else:
-            time.sleep(0.01)
+            consecutive_failures += 1
+            if consecutive_failures == 1 and microscope_connected:
+                print("✗ USB microscope disconnected")
+                microscope_connected = False
+                # Send black frame
+                black_frame = create_black_frame()
+                if black_frame:
+                    with frame_lock:
+                        current_frame = black_frame
+                        current_frame_number += 1
+                    frame_event.set()
+            
+            # Exit after too many failures to allow reconnection
+            if consecutive_failures >= max_failures:
+                print("Too many failures, releasing camera for reconnection...")
+                break
+            
+            time.sleep(0.1)
 
     cap.release()
+    usb_camera_cap = None
+    microscope_connected = False
     print("USB capture stopped")
 
 def capture_wifi():
     """Capture frames from WiFi microscope and apply processing"""
-    global current_frame, running, connection_mode
+    global current_frame, running, connection_mode, microscope_connected
 
     print(f"Attempting to connect to WiFi microscope at {HOST}...")
 
@@ -1696,16 +1772,24 @@ def capture_wifi():
                 heartbeat_counter = 0
 
                 connection_mode = 'wifi'
+                microscope_connected = True
                 print("Connected to WiFi microscope, receiving data...")
                 print("All image processing done in Python - sliders affect image in real-time\n")
 
                 frame_counter = 0
                 last_debug_time = time.time()
+                last_frame_time = time.time()
+                no_data_timeout = 3.0
 
                 while running:
                     try:
                         data = r.recv(1450)
                         if len(data) > 8:
+                            last_frame_time = time.time()
+                            if not microscope_connected:
+                                print("✓ WiFi microscope reconnected")
+                                microscope_connected = True
+                            
                             framecount = data[0] + data[1]*256
                             packetcount = data[3]
 
@@ -1762,23 +1846,29 @@ def capture_wifi():
                             else:
                                 frame_buffer.extend(data[8:])
                     except:
+                        # Check for timeout (no data received)
+                        if time.time() - last_frame_time > no_data_timeout:
+                            if microscope_connected:
+                                print("✗ WiFi microscope disconnected (no data)")
+                                microscope_connected = False
+                                # Send black frame
+                                black_frame = create_black_frame()
+                                if black_frame:
+                                    with frame_lock:
+                                        current_frame = black_frame
+                                        current_frame_number += 1
+                                    frame_event.set()
+                            last_frame_time = time.time()  # Reset to avoid spam
                         time.sleep(0.001)
 
             s.sendto(b"JHCMD\xd0\x02", (HOST, SPORT))
             print("WiFi capture stopped")
     except Exception as e:
         print(f"WiFi connection failed: {e}")
+        microscope_connected = False
 
-def capture_microscope():
-    """Capture frames from microscope - tries WiFi first, then USB"""
-    global connection_mode, current_frame
-
-    print("\n" + "="*50)
-    print("Detecting microscope connection...")
-    print("="*50)
-
-    # Check WiFi first
-    wifi_available = False
+def check_wifi_available():
+    """Check if WiFi microscope is available"""
     try:
         test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         test_sock.settimeout(0.5)
@@ -1792,22 +1882,57 @@ def capture_microscope():
         recv_sock.bind(("", RPORT))
 
         data = recv_sock.recv(1450)
-        if len(data) > 8:
-            wifi_available = True
         recv_sock.close()
+        return len(data) > 8
     except:
-        pass
+        return False
 
-    if wifi_available:
-        print("✓ WiFi microscope detected")
-        capture_wifi()
-    elif USB_AVAILABLE:
-        print("✗ WiFi microscope not found, trying USB...")
-        capture_usb()
-    else:
-        print("✗ No microscope found (WiFi not reachable, OpenCV not available for USB)")
-        print("\nTo enable USB support, install OpenCV:")
-        print("  pip3 install opencv-python")
+def capture_microscope():
+    """Capture frames from microscope with automatic reconnection"""
+    global connection_mode, current_frame, microscope_connected, current_frame_number
+
+    print("\n" + "="*50)
+    print("Microscope Auto-Reconnect Service Started")
+    print("="*50)
+
+    while running:
+        # Send black frame if disconnected
+        if not microscope_connected:
+            black_frame = create_black_frame()
+            if black_frame:
+                with frame_lock:
+                    current_frame = black_frame
+                    current_frame_number += 1
+                frame_event.set()
+        
+        print("\nDetecting microscope connection...")
+        
+        # Check WiFi first
+        wifi_available = check_wifi_available()
+        
+        if wifi_available:
+            print("✓ WiFi microscope detected")
+            connection_mode = 'wifi'
+            capture_wifi()
+            # If capture_wifi returns, connection was lost
+            if running:
+                print("Connection lost. Attempting to reconnect in 3 seconds...")
+                microscope_connected = False
+                time.sleep(3)
+        elif USB_AVAILABLE:
+            print("✗ WiFi not found, trying USB...")
+            connection_mode = 'usb'
+            capture_usb()
+            # If capture_usb returns, connection was lost
+            if running:
+                print("Connection lost. Attempting to reconnect in 3 seconds...")
+                microscope_connected = False
+                time.sleep(3)
+        else:
+            if not microscope_connected:
+                print("✗ No microscope found")
+                microscope_connected = False
+            time.sleep(3)  # Wait before retrying
 
 def main():
     global running, connection_mode
