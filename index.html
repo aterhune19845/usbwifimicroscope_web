@@ -357,21 +357,53 @@
                     <button id="stabilize-btn" onclick="toggleStabilize()">Stabilize: OFF</button>
                 </div>
                 <div id="stabilize-settings" style="display: none; margin-top: 10px;">
+                    <div style="margin-bottom: 15px; padding: 10px; background: #1a1a1a; border-radius: 6px;">
+                        <h4 style="margin: 0 0 10px 0; font-size: 12px; color: #999;">Stabilization Mode</h4>
+                        <div class="button-group">
+                            <button id="crop-btn" onclick="toggleCrop()" style="grid-column: 1 / -1;">Crop Mode: OFF</button>
+                        </div>
+                        <div id="crop-margin-control" style="display: none; margin-top: 10px;">
+                            <label style="display: block; margin-bottom: 6px; font-size: 13px; color: #ccc;">Crop Margin: <span class="slider-value" id="crop-margin-value">8%</span></label>
+                            <input type="range" id="crop-margin-slider" min="5" max="15" value="8" step="1" style="width: 100%;">
+                        </div>
+                    </div>
+                    <div id="blend-methods" style="margin-bottom: 15px; padding: 10px; background: #1a1a1a; border-radius: 6px;">
+                        <h4 style="margin: 0 0 10px 0; font-size: 12px; color: #999;">Blend Methods</h4>
+                        <div class="button-group">
+                            <button id="lowpass-btn" onclick="toggleLowpass()">Low-Pass: OFF</button>
+                            <button id="kalman-btn" onclick="toggleKalman()">Kalman: OFF</button>
+                        </div>
+                        <div class="button-group" style="margin-top: 8px;">
+                            <button id="ema-btn" onclick="toggleEMA()">EMA Blend: OFF</button>
+                        </div>
+                        <div id="ema-type-control" style="margin-top: 10px; display: none;">
+                            <label style="display: block; margin-bottom: 6px; font-size: 12px; color: #999;">EMA Type:</label>
+                            <div class="button-group">
+                                <button id="ema-regular-btn" onclick="setEMAType('regular')" style="background: #4a9eff;">Regular</button>
+                                <button id="ema-tema-btn" onclick="setEMAType('tema')">TEMA</button>
+                                <button id="ema-hma-btn" onclick="setEMAType('hma')">HMA</button>
+                            </div>
+                        </div>
+                    </div>
                     <div class="slider-control">
                         <label>Noise Filter: <span class="slider-value" id="stab-noise-value">0.0</span></label>
                         <input type="range" id="stab-noise-slider" min="0" max="30" value="0" step="1">
+                    </div>
+                    <div class="slider-control">
+                        <label>Low-Pass Strength: <span class="slider-value" id="lowpass-alpha-value">0.00</span></label>
+                        <input type="range" id="lowpass-alpha-slider" min="0" max="99" value="0" step="5">
                     </div>
                     <div class="slider-control">
                         <label>Smoothing: <span class="slider-value" id="stab-smooth-value">0.00</span></label>
                         <input type="range" id="stab-smooth-slider" min="0" max="90" value="0" step="5">
                     </div>
                     <div class="slider-control">
-                        <label>Decay: <span class="slider-value" id="stab-decay-value">0.3</span></label>
-                        <input type="range" id="stab-decay-slider" min="30" max="95" value="30" step="5">
+                        <label>Decay: <span class="slider-value" id="stab-decay-value">0.00</span></label>
+                        <input type="range" id="stab-decay-slider" min="0" max="99" value="0" step="1">
                     </div>
                     <div class="slider-control">
-                        <label>Frame Blend: <span class="slider-value" id="stab-blend-value">4</span></label>
-                        <input type="range" id="stab-blend-slider" min="1" max="10" value="4" step="1">
+                        <label>Frame Blend: <span class="slider-value" id="stab-blend-value">3</span></label>
+                        <input type="range" id="stab-blend-slider" min="1" max="10" value="3" step="1">
                     </div>
                     <div class="button-group" style="margin-top: 10px;">
                         <button onclick="resetStabilizeSettings()">Reset to Defaults</button>
@@ -389,13 +421,23 @@
                     <button onclick="zoomIn()">Zoom In</button>
                     <button onclick="zoomOut()">Zoom Out</button>
                 </div>
+                <div style="margin-top: 10px; padding: 10px; background: #1a1a1a; border-radius: 6px;">
+                    <h4 style="margin: 0 0 10px 0; font-size: 12px; color: #999;">Upscaling Quality</h4>
+                    <div class="button-group">
+                        <button id="lanczos-btn" onclick="toggleLanczos()">Lanczos: ON</button>
+                        <button id="ai-upscale-btn" onclick="toggleAIUpscale()">AI Upscale: OFF</button>
+                    </div>
+                    <p style="font-size: 11px; color: #666; margin: 8px 0 0 0;">
+                        Lanczos: High quality, fast • AI: Best quality, slower
+                    </p>
+                </div>
             </div>
 
             <div class="control-group">
                 <h3>Capture Settings</h3>
                 <div class="slider-control">
-                    <label>JPEG Quality: <span class="slider-value" id="quality-value">100</span></label>
-                    <input type="range" id="quality-slider" min="10" max="100" value="100" step="5">
+                    <label>JPEG Quality: <span class="slider-value" id="quality-value">75</span></label>
+                    <input type="range" id="quality-slider" min="10" max="100" value="75" step="5">
                 </div>
             </div>
 
@@ -630,16 +672,147 @@
                 .catch(err => console.error('Failed to set frame blend:', err));
         });
 
+        // Crop margin slider
+        const cropMarginSlider = document.getElementById('crop-margin-slider');
+        const cropMarginValue = document.getElementById('crop-margin-value');
+        cropMarginSlider.addEventListener('input', function() {
+            cropMarginValue.textContent = this.value + '%';
+        });
+        cropMarginSlider.addEventListener('change', function() {
+            fetch(`/process/stab_crop_margin/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set crop margin:', err));
+        });
+
+        // Low-pass filter alpha slider
+        const lowpassAlphaSlider = document.getElementById('lowpass-alpha-slider');
+        const lowpassAlphaValue = document.getElementById('lowpass-alpha-value');
+        lowpassAlphaSlider.addEventListener('input', function() {
+            const value = (this.value / 100).toFixed(2);
+            lowpassAlphaValue.textContent = value;
+        });
+        lowpassAlphaSlider.addEventListener('change', function() {
+            fetch(`/process/stab_lowpass_alpha/${this.value}`, { method: 'POST' })
+                .catch(err => console.error('Failed to set low-pass alpha:', err));
+        });
+
+        // Advanced stabilization method toggles
+        let cropEnabled = false;
+        let lowpassEnabled = false;
+        let kalmanEnabled = false;
+        let emaEnabled = false;
+
+        function toggleCrop() {
+            fetch('/process/stab_use_crop/toggle', { method: 'POST' })
+                .then(response => {
+                    cropEnabled = !cropEnabled;
+                    document.getElementById('crop-btn').textContent =
+                        'Crop Mode: ' + (cropEnabled ? 'ON' : 'OFF');
+                    // Show/hide crop margin slider
+                    document.getElementById('crop-margin-control').style.display =
+                        cropEnabled ? 'block' : 'none';
+                    // Show/hide blend methods (not applicable when crop is on)
+                    document.getElementById('blend-methods').style.display =
+                        cropEnabled ? 'none' : 'block';
+                })
+                .catch(err => console.error('Failed to toggle crop mode:', err));
+        }
+
+        function toggleLowpass() {
+            fetch('/process/stab_use_lowpass/toggle', { method: 'POST' })
+                .then(response => {
+                    lowpassEnabled = !lowpassEnabled;
+                    document.getElementById('lowpass-btn').textContent =
+                        'Low-Pass: ' + (lowpassEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to toggle low-pass:', err));
+        }
+
+        function toggleKalman() {
+            fetch('/process/stab_use_kalman/toggle', { method: 'POST' })
+                .then(response => {
+                    kalmanEnabled = !kalmanEnabled;
+                    document.getElementById('kalman-btn').textContent =
+                        'Kalman: ' + (kalmanEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to toggle Kalman:', err));
+        }
+
+        function toggleEMA() {
+            fetch('/process/stab_use_ema/toggle', { method: 'POST' })
+                .then(response => {
+                    emaEnabled = !emaEnabled;
+                    document.getElementById('ema-btn').textContent =
+                        'EMA Blend: ' + (emaEnabled ? 'ON' : 'OFF');
+                    // Show/hide EMA type control
+                    document.getElementById('ema-type-control').style.display =
+                        emaEnabled ? 'block' : 'none';
+                })
+                .catch(err => console.error('Failed to toggle EMA:', err));
+        }
+
+        // Zoom upscaling toggles
+        let lanczosEnabled = true;
+        let aiUpscaleEnabled = false;
+
+        function toggleLanczos() {
+            fetch('/process/use_lanczos/toggle', { method: 'POST' })
+                .then(response => {
+                    lanczosEnabled = !lanczosEnabled;
+                    document.getElementById('lanczos-btn').textContent =
+                        'Lanczos: ' + (lanczosEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to toggle Lanczos:', err));
+        }
+
+        function toggleAIUpscale() {
+            fetch('/process/use_ai_upscale/toggle', { method: 'POST' })
+                .then(response => {
+                    aiUpscaleEnabled = !aiUpscaleEnabled;
+                    document.getElementById('ai-upscale-btn').textContent =
+                        'AI Upscale: ' + (aiUpscaleEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to toggle AI upscale:', err));
+        }
+
+        let currentEMAType = 'regular';
+
+        function setEMAType(type) {
+            fetch(`/process/stab_ema_type/${type}`, { method: 'POST' })
+                .then(response => {
+                    currentEMAType = type;
+                    // Update button styles
+                    document.getElementById('ema-regular-btn').style.background = type === 'regular' ? '#4a9eff' : '';
+                    document.getElementById('ema-tema-btn').style.background = type === 'tema' ? '#4a9eff' : '';
+                    document.getElementById('ema-hma-btn').style.background = type === 'hma' ? '#4a9eff' : '';
+                })
+                .catch(err => console.error('Failed to set EMA type:', err));
+        }
+
         function resetStabilizeSettings() {
-            // Reset sliders to default values
+            // Reset sliders to default values (minimal filtering)
             stabNoiseSlider.value = 0;
             stabNoiseValue.textContent = '0.0';
             stabSmoothSlider.value = 0;
             stabSmoothValue.textContent = '0.00';
-            stabDecaySlider.value = 30;
-            stabDecayValue.textContent = '0.30';
-            stabBlendSlider.value = 4;
-            stabBlendValue.textContent = '4';
+            stabDecaySlider.value = 0;
+            stabDecayValue.textContent = '0.00';
+            stabBlendSlider.value = 3;
+            stabBlendValue.textContent = '3';
+            lowpassAlphaSlider.value = 0;
+            lowpassAlphaValue.textContent = '0.00';
+            cropMarginSlider.value = 8;
+            cropMarginValue.textContent = '8%';
+
+            // Reset advanced methods to defaults (all OFF)
+            if (cropEnabled) toggleCrop();
+            if (lowpassEnabled) toggleLowpass();
+            if (kalmanEnabled) toggleKalman();
+            if (emaEnabled) toggleEMA();
+
+            // Reset EMA type to regular
+            if (currentEMAType !== 'regular') {
+                setEMAType('regular');
+            }
 
             // Send reset request to server
             fetch('/process/stab_reset/1', { method: 'POST' })
@@ -947,6 +1120,68 @@
                 toggleStabilize();
             }
         });
+
+        // Sync UI with backend settings on page load
+        function syncSettings() {
+            fetch('/settings')
+                .then(response => response.json())
+                .then(settings => {
+                    // Update stabilization button and panel
+                    const stabilizeBtn = document.getElementById('stabilize-btn');
+                    const stabilizeSettings = document.getElementById('stabilize-settings');
+                    stabilizeBtn.textContent = 'Stabilize: ' + (settings.stabilize ? 'ON' : 'OFF');
+                    stabilizeSettings.style.display = settings.stabilize ? 'block' : 'none';
+
+                    // Update slider values
+                    stabNoiseSlider.value = settings.stab_noise;
+                    stabNoiseValue.textContent = settings.stab_noise.toFixed(1);
+                    stabSmoothSlider.value = settings.stab_smooth;
+                    stabSmoothValue.textContent = (settings.stab_smooth / 100).toFixed(2);
+                    stabDecaySlider.value = settings.stab_decay;
+                    stabDecayValue.textContent = (settings.stab_decay / 100).toFixed(2);
+                    stabBlendSlider.value = settings.stab_blend;
+                    stabBlendValue.textContent = settings.stab_blend;
+                    lowpassAlphaSlider.value = settings.stab_lowpass_alpha;
+                    lowpassAlphaValue.textContent = (settings.stab_lowpass_alpha / 100).toFixed(2);
+                    cropMarginSlider.value = settings.stab_crop_margin;
+                    cropMarginValue.textContent = settings.stab_crop_margin + '%';
+
+                    // Update toggle buttons
+                    cropEnabled = settings.stab_use_crop;
+                    document.getElementById('crop-btn').textContent = 'Crop Mode: ' + (cropEnabled ? 'ON' : 'OFF');
+                    document.getElementById('crop-margin-control').style.display = cropEnabled ? 'block' : 'none';
+
+                    lowpassEnabled = settings.stab_use_lowpass;
+                    document.getElementById('lowpass-btn').textContent = 'Low-Pass: ' + (lowpassEnabled ? 'ON' : 'OFF');
+
+                    kalmanEnabled = settings.stab_use_kalman;
+                    document.getElementById('kalman-btn').textContent = 'Kalman: ' + (kalmanEnabled ? 'ON' : 'OFF');
+
+                    emaEnabled = settings.stab_use_ema;
+                    document.getElementById('ema-btn').textContent = 'EMA Blend: ' + (emaEnabled ? 'ON' : 'OFF');
+                    document.getElementById('ema-type-control').style.display = emaEnabled ? 'block' : 'none';
+
+                    // Update blend methods visibility
+                    document.getElementById('blend-methods').style.display = cropEnabled ? 'none' : 'block';
+
+                    // Update EMA type buttons
+                    currentEMAType = settings.stab_ema_type;
+                    document.getElementById('ema-regular-btn').style.background = currentEMAType === 'regular' ? '#4a9eff' : '';
+                    document.getElementById('ema-tema-btn').style.background = currentEMAType === 'tema' ? '#4a9eff' : '';
+                    document.getElementById('ema-hma-btn').style.background = currentEMAType === 'hma' ? '#4a9eff' : '';
+
+                    // Update zoom upscaling buttons
+                    lanczosEnabled = settings.use_lanczos;
+                    document.getElementById('lanczos-btn').textContent = 'Lanczos: ' + (lanczosEnabled ? 'ON' : 'OFF');
+
+                    aiUpscaleEnabled = settings.use_ai_upscale;
+                    document.getElementById('ai-upscale-btn').textContent = 'AI Upscale: ' + (aiUpscaleEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to sync settings:', err));
+        }
+
+        // Load settings when page loads
+        window.addEventListener('load', syncSettings);
     </script>
 </body>
 </html>
