@@ -36,6 +36,13 @@ settings = {
     'stab_use_crop': False,     # Warp mode (better for panning)
     'stab_lowpass_alpha': 0,   # Low-pass strength OFF
     'stab_crop_margin': 10,      # Crop margin percentage (5-15%)
+    # PCB/Circuit Board Enhancement
+    'enhance_clahe': True,      # CLAHE contrast enhancement (ON by default - helps tracking!)
+    'enhance_edges': False,     # Edge detection overlay
+    'enhance_sharpen': True,    # Sharpening filter (ON by default for PCB inspection)
+    'enhance_invert': False,    # Color inversion
+    # Annotation Tracking
+    'track_annotations': True,  # Track annotations with image motion
     'jpeg_quality': 75,    # Lower quality = faster encoding, minimal visual difference
     'capture_fps': 30,
 }
@@ -70,6 +77,16 @@ stab_hma_long = None
 # AI Super-Resolution state
 ai_upscaler = None
 ai_model_loaded = False
+
+# Annotation tracking state
+current_motion_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]  # Affine matrix [a, b, tx, c, d, ty]
+motion_sequence = 0  # Increments each time motion is updated
+motion_lock = threading.Lock()
+tracking_prev_gray = None  # Separate from stabilization for different resolution
+tracking_points = None  # Feature points for optical flow tracking
+motion_history = []  # Smoothing history
+motion_velocity = (0.0, 0.0)  # Velocity for prediction
+motion_ema_matrix = None  # EMA-smoothed motion (syncs with stabilization EMA)
 
 def init_ai_upscaler():
     global ai_upscaler, ai_model_loaded
@@ -140,6 +157,189 @@ def apply_stabilization(frame, s):
     global stab_kalman_x, stab_kalman_y, stab_ema_frame
     global stab_tema_ema1, stab_tema_ema2, stab_tema_ema3
     global stab_hma_short, stab_hma_long
+    global current_motion_matrix, motion_sequence, motion_lock, tracking_prev_gray, tracking_points, motion_history, motion_velocity, motion_ema_matrix
+
+    # Always track motion for annotations using optical flow (even when stabilization is off)
+    # Optical flow handles fast jerky movements much better than phase correlation
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    if s['track_annotations']:
+        if tracking_prev_gray is not None and tracking_prev_gray.shape == gray.shape:
+            try:
+                # If we don't have tracking points or too few remain, detect new ones
+                if tracking_points is None or len(tracking_points) < 30:
+                    # Detect good features distributed across the image
+                    # More features = more robust tracking
+                    tracking_points = cv2.goodFeaturesToTrack(
+                        tracking_prev_gray,
+                        maxCorners=200,  # Track more features
+                        qualityLevel=0.01,
+                        minDistance=20,  # Better distribution
+                        blockSize=7,
+                        useHarrisDetector=True,
+                        k=0.04
+                    )
+
+                if tracking_points is not None and len(tracking_points) > 0:
+                    # Use motion prediction to help with very fast movements
+                    # Predict where features should be based on velocity
+                    predicted_points = tracking_points.copy()
+                    if motion_velocity[0] != 0 or motion_velocity[1] != 0:
+                        predicted_points[:, 0, 0] += motion_velocity[0]
+                        predicted_points[:, 0, 1] += motion_velocity[1]
+
+                    # Track features using Lucas-Kanade optical flow
+                    # OPTIMIZED FOR 24FPS: Larger window and more pyramid levels
+                    new_points, status, err = cv2.calcOpticalFlowPyrLK(
+                        tracking_prev_gray,
+                        gray,
+                        tracking_points,
+                        predicted_points,  # Use predicted positions as initial guess
+                        winSize=(71, 71),  # Massive search window for 24fps large displacements
+                        maxLevel=6,  # 6 pyramid levels = can handle ~64x motions (up to 300+ pixels)
+                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.005),
+                        flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS,
+                        minEigThreshold=0.00005  # Very permissive for extreme motion
+                    )
+
+                    # Select good points (successfully tracked)
+                    if new_points is not None and status is not None:
+                        good_old = tracking_points[status == 1]
+                        good_new = new_points[status == 1]
+
+                        if len(good_new) > 10:  # Need at least 10 points for reliable motion
+                            # Use RANSAC to estimate rigid transform and reject outliers
+                            # This handles rotation/scale and is more robust than median
+                            try:
+                                # Estimate affine transform using RANSAC
+                                M, inliers = cv2.estimateAffinePartial2D(
+                                    good_old, good_new,
+                                    method=cv2.RANSAC,
+                                    ransacReprojThreshold=3.0,
+                                    maxIters=2000,
+                                    confidence=0.99
+                                )
+
+                                if M is not None and inliers is not None and np.sum(inliers) > 5:
+                                    # Store full affine matrix: [a, b, tx, c, d, ty]
+                                    # where [[a, b, tx], [c, d, ty]] is the 2x3 affine matrix
+                                    motion_matrix = [
+                                        float(M[0, 0]), float(M[0, 1]), float(M[0, 2]),
+                                        float(M[1, 0]), float(M[1, 1]), float(M[1, 2])
+                                    ]
+                                    # Keep only inlier points for next frame
+                                    tracking_points = good_new[inliers.ravel() == 1].reshape(-1, 1, 2)
+                                else:
+                                    # RANSAC failed, fall back to median (pure translation)
+                                    motion_vectors = good_new - good_old
+                                    dx = float(np.median(motion_vectors[:, 0]))
+                                    dy = float(np.median(motion_vectors[:, 1]))
+                                    # Identity matrix with translation
+                                    motion_matrix = [1.0, 0.0, dx, 0.0, 1.0, dy]
+                                    tracking_points = good_new.reshape(-1, 1, 2)
+                            except:
+                                # RANSAC error, use median (pure translation)
+                                motion_vectors = good_new - good_old
+                                dx = float(np.median(motion_vectors[:, 0]))
+                                dy = float(np.median(motion_vectors[:, 1]))
+                                # Identity matrix with translation
+                                motion_matrix = [1.0, 0.0, dx, 0.0, 1.0, dy]
+                                tracking_points = good_new.reshape(-1, 1, 2)
+
+                            # Apply temporal smoothing to reduce jitter
+                            motion_history.append(motion_matrix)
+                            if len(motion_history) > 3:  # Keep last 3 frames
+                                motion_history.pop(0)
+
+                            # Weighted average of matrix elements: more recent = higher weight
+                            if len(motion_history) >= 2:
+                                weights = [1, 2, 3][-len(motion_history):]
+                                total_weight = sum(weights)
+                                smooth_matrix = [
+                                    sum(w * m[i] for w, m in zip(weights, motion_history)) / total_weight
+                                    for i in range(6)
+                                ]
+                            else:
+                                smooth_matrix = motion_matrix
+
+                            # Update velocity for motion prediction (use translation components)
+                            motion_velocity = (smooth_matrix[2], smooth_matrix[5])
+
+                            # Apply additional EMA smoothing if stabilization is ON with EMA
+                            # This syncs annotation movement with the stabilized image smoothing
+                            global motion_ema_matrix
+                            if s['stabilize'] and not s['stab_use_crop'] and s['stab_use_ema']:
+                                # Use same alpha as stabilization EMA for perfect sync
+                                alpha = 1.0 / (s['stab_blend'] * 2)
+                                if motion_ema_matrix is None:
+                                    motion_ema_matrix = smooth_matrix[:]
+                                else:
+                                    # Apply EMA to each matrix component
+                                    motion_ema_matrix = [
+                                        alpha * smooth_matrix[i] + (1 - alpha) * motion_ema_matrix[i]
+                                        for i in range(6)
+                                    ]
+                                final_matrix = motion_ema_matrix
+                            else:
+                                # Use normal weighted-average smoothing
+                                motion_ema_matrix = None
+                                final_matrix = smooth_matrix
+
+                            with motion_lock:
+                                current_motion_matrix = final_matrix
+                                motion_sequence += 1
+                        else:
+                            # Not enough good points, reset and try again next frame
+                            tracking_points = None
+                            motion_history.clear()
+                            motion_velocity = (0.0, 0.0)
+                            motion_ema_matrix = None
+                            with motion_lock:
+                                current_motion_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+                                motion_sequence += 1
+                    else:
+                        tracking_points = None
+                        motion_history.clear()
+                        motion_velocity = (0.0, 0.0)
+                        motion_ema_matrix = None
+                        with motion_lock:
+                            current_motion_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+                            motion_sequence += 1
+                else:
+                    motion_history.clear()
+                    motion_velocity = (0.0, 0.0)
+                    motion_ema_matrix = None
+                    with motion_lock:
+                        current_motion_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+                        motion_sequence += 1
+            except:
+                tracking_points = None
+                motion_history.clear()
+                motion_velocity = (0.0, 0.0)
+                motion_ema_matrix = None
+                with motion_lock:
+                    current_motion_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+                    motion_sequence += 1
+        else:
+            tracking_points = None
+            motion_history.clear()
+            motion_velocity = (0.0, 0.0)
+            with motion_lock:
+                current_motion_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+                motion_sequence += 1
+
+        # Update tracking reference frame
+        tracking_prev_gray = gray.copy()
+    else:
+        tracking_prev_gray = None
+        tracking_points = None
+        motion_history.clear()
+        motion_velocity = (0.0, 0.0)
+        motion_ema_matrix = None
+        with motion_lock:
+            current_motion_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+            motion_sequence += 1
 
     if not s['stabilize']:
         stab_prev_gray = None
@@ -158,225 +358,255 @@ def apply_stabilization(frame, s):
         stab_tema_ema3 = None
         stab_hma_short = None
         stab_hma_long = None
-        return frame
+        stabilized = frame
 
-    h, w = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray_small = cv2.resize(gray, (int(w/2), int(h/2)))
-
-    if stab_prev_gray is None or stab_prev_gray.shape != gray_small.shape:
-        stab_prev_gray = gray_small.copy()
-        stab_frame_buffer = []
-        stab_filtered_dx = 0.0
-        stab_filtered_dy = 0.0
-        stab_kalman_x = None
-        stab_kalman_y = None
-        stab_ema_frame = None
-        return frame
-
-    try:
-        # Detect motion using phase correlation
-        shift, _ = cv2.phaseCorrelate(stab_prev_gray.astype(np.float32), gray_small.astype(np.float32))
-        dx, dy = shift
-        dx *= 2
-        dy *= 2
-
-        stab_prev_gray = gray_small.copy()
-
-        # Apply noise threshold
-        noise_threshold = s['stab_noise'] / 10.0
-        if abs(dx) < noise_threshold:
-            dx = 0
-        if abs(dy) < noise_threshold:
-            dy = 0
-
-        # Low-pass filter on motion (smooth out high-frequency jitter)
-        if s['stab_use_lowpass'] and s['stab_lowpass_alpha'] > 0:
-            # Higher alpha = MORE filtering (keeps more history)
-            # At 95, this will create VERY obvious lag
-            alpha = (s['stab_lowpass_alpha'] / 100.0) ** 0.3  # Even more aggressive curve
-            stab_filtered_dx = alpha * stab_filtered_dx + (1 - alpha) * dx
-            stab_filtered_dy = alpha * stab_filtered_dy + (1 - alpha) * dy
-            dx = stab_filtered_dx
-            dy = stab_filtered_dy
-
-            # Debug: Show how much filtering is happening
-            if abs(dx) > 1 or abs(dy) > 1:
-                raw_motion = (dx / (1 - alpha) if alpha < 0.99 else dx)
-                filtering_ratio = (dx / raw_motion * 100) if raw_motion != 0 else 100
-                # This shows how much motion is being filtered out
-
-        # Kalman filter for periodic motion prediction
-        if s['stab_use_kalman']:
-            # Initialize Kalman filters if needed (simple 2-state: position, velocity)
-            if stab_kalman_x is None:
-                stab_kalman_x = cv2.KalmanFilter(2, 1)  # 2 state vars (position, velocity), 1 measurement (position)
-                stab_kalman_y = cv2.KalmanFilter(2, 1)
-
-                # State transition matrix: x_new = x + v*dt, v_new = v (constant velocity model)
-                dt = 1.0
-                stab_kalman_x.transitionMatrix = np.array([[1, dt], [0, 1]], dtype=np.float32)
-                stab_kalman_y.transitionMatrix = stab_kalman_x.transitionMatrix.copy()
-
-                # Measurement matrix: we only measure position
-                stab_kalman_x.measurementMatrix = np.array([[1, 0]], dtype=np.float32)
-                stab_kalman_y.measurementMatrix = stab_kalman_x.measurementMatrix.copy()
-
-                # Process noise (how much we trust the model) - lower = trust model more
-                stab_kalman_x.processNoiseCov = np.eye(2, dtype=np.float32) * 0.001
-                stab_kalman_y.processNoiseCov = np.eye(2, dtype=np.float32) * 0.001
-
-                # Measurement noise (how much we trust the measurements) - higher = smooth more
-                stab_kalman_x.measurementNoiseCov = np.array([[1.0]], dtype=np.float32)
-                stab_kalman_y.measurementNoiseCov = np.array([[1.0]], dtype=np.float32)
-
-            # Predict next state
-            stab_kalman_x.predict()
-            stab_kalman_y.predict()
-
-            # Correct with measurement
-            measurement_x = np.array([[dx]], dtype=np.float32)
-            measurement_y = np.array([[dy]], dtype=np.float32)
-
-            stab_kalman_x.correct(measurement_x)
-            stab_kalman_y.correct(measurement_y)
-
-            # Use filtered position (smoother than raw measurement)
-            dx = stab_kalman_x.statePost[0, 0]
-            dy = stab_kalman_y.statePost[0, 0]
-
-        max_shift = min(w, h) * 0.3
-        if abs(dx) < max_shift and abs(dy) < max_shift:
-            # Use traditional accumulation and smoothing for both modes
-            # This provides better vibration filtering than direct tracking
-            stab_accumulated_x += dx
-            stab_accumulated_y += dy
-            stab_accumulated_x *= s['stab_decay'] / 100.0
-            stab_accumulated_y *= s['stab_decay'] / 100.0
-
-            max_accum = min(w, h) * 0.5
-            stab_accumulated_x = max(-max_accum, min(max_accum, stab_accumulated_x))
-            stab_accumulated_y = max(-max_accum, min(max_accum, stab_accumulated_y))
-
-            smooth = s['stab_smooth'] / 100.0
-            stab_smooth_correction_x = smooth * stab_smooth_correction_x + (1 - smooth) * (-stab_accumulated_x)
-            stab_smooth_correction_y = smooth * stab_smooth_correction_y + (1 - smooth) * (-stab_accumulated_y)
-
-            # Crop-based stabilization (no motion blur!)
-            if s['stab_use_crop']:
-                # Calculate crop size based on margin percentage
-                margin_pct = s['stab_crop_margin'] / 100.0
-                crop_w = int(w * (1 - margin_pct * 2))
-                crop_h = int(h * (1 - margin_pct * 2))
-
-                # Calculate the center of the crop window
-                # Start from the frame center
-                center_x = w // 2
-                center_y = h // 2
-
-                # Offset by the correction (negate to move crop window opposite of shake)
-                # If camera shakes RIGHT, we need to crop from the RIGHT side
-                # Keep as float for sub-pixel accuracy
-                offset_x = -stab_smooth_correction_x
-                offset_y = -stab_smooth_correction_y
-
-                # Calculate crop boundaries with float precision
-                crop_x1_float = center_x - crop_w / 2.0 + offset_x
-                crop_y1_float = center_y - crop_h / 2.0 + offset_y
-                crop_x2_float = crop_x1_float + crop_w
-                crop_y2_float = crop_y1_float + crop_h
-
-                # Clamp to frame boundaries
-                crop_x1_float = max(0, min(w - crop_w, crop_x1_float))
-                crop_y1_float = max(0, min(h - crop_h, crop_y1_float))
-                crop_x2_float = crop_x1_float + crop_w
-                crop_y2_float = crop_y1_float + crop_h
-
-                # Convert to int only for final crop extraction
-                crop_x1 = int(crop_x1_float)
-                crop_y1 = int(crop_y1_float)
-                crop_x2 = int(crop_x2_float)
-                crop_y2 = int(crop_y2_float)
-
-                # Extract crop and resize back to original size
-                cropped = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                stabilized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-            else:
-                # Traditional warp-based stabilization
-                M = np.float32([[1, 0, stab_smooth_correction_x], [0, 1, stab_smooth_correction_y]])
-                stabilized = cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
-        else:
-            stab_accumulated_x = 0.0
-            stab_accumulated_y = 0.0
-            stab_smooth_correction_x = 0.0
-            stab_smooth_correction_y = 0.0
+    if s['stabilize']:
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_small = cv2.resize(gray, (int(w/2), int(h/2)))
+    
+        if stab_prev_gray is None or stab_prev_gray.shape != gray_small.shape:
+            stab_prev_gray = gray_small.copy()
             stab_frame_buffer = []
+            stab_filtered_dx = 0.0
+            stab_filtered_dy = 0.0
+            stab_kalman_x = None
+            stab_kalman_y = None
+            stab_ema_frame = None
+            return frame
+    
+        try:
+            # Detect motion using phase correlation
+            shift, _ = cv2.phaseCorrelate(stab_prev_gray.astype(np.float32), gray_small.astype(np.float32))
+            dx, dy = shift
+            dx *= 2
+            dy *= 2
+    
+            stab_prev_gray = gray_small.copy()
+    
+            # Apply noise threshold
+            noise_threshold = s['stab_noise'] / 10.0
+            if abs(dx) < noise_threshold:
+                dx = 0
+            if abs(dy) < noise_threshold:
+                dy = 0
+    
+            # Low-pass filter on motion (smooth out high-frequency jitter)
+            if s['stab_use_lowpass'] and s['stab_lowpass_alpha'] > 0:
+                # Higher alpha = MORE filtering (keeps more history)
+                # At 95, this will create VERY obvious lag
+                alpha = (s['stab_lowpass_alpha'] / 100.0) ** 0.3  # Even more aggressive curve
+                stab_filtered_dx = alpha * stab_filtered_dx + (1 - alpha) * dx
+                stab_filtered_dy = alpha * stab_filtered_dy + (1 - alpha) * dy
+                dx = stab_filtered_dx
+                dy = stab_filtered_dy
+    
+                # Debug: Show how much filtering is happening
+                if abs(dx) > 1 or abs(dy) > 1:
+                    raw_motion = (dx / (1 - alpha) if alpha < 0.99 else dx)
+                    filtering_ratio = (dx / raw_motion * 100) if raw_motion != 0 else 100
+                    # This shows how much motion is being filtered out
+    
+            # Kalman filter for periodic motion prediction
+            if s['stab_use_kalman']:
+                # Initialize Kalman filters if needed (simple 2-state: position, velocity)
+                if stab_kalman_x is None:
+                    stab_kalman_x = cv2.KalmanFilter(2, 1)  # 2 state vars (position, velocity), 1 measurement (position)
+                    stab_kalman_y = cv2.KalmanFilter(2, 1)
+    
+                    # State transition matrix: x_new = x + v*dt, v_new = v (constant velocity model)
+                    dt = 1.0
+                    stab_kalman_x.transitionMatrix = np.array([[1, dt], [0, 1]], dtype=np.float32)
+                    stab_kalman_y.transitionMatrix = stab_kalman_x.transitionMatrix.copy()
+    
+                    # Measurement matrix: we only measure position
+                    stab_kalman_x.measurementMatrix = np.array([[1, 0]], dtype=np.float32)
+                    stab_kalman_y.measurementMatrix = stab_kalman_x.measurementMatrix.copy()
+    
+                    # Process noise (how much we trust the model) - lower = trust model more
+                    stab_kalman_x.processNoiseCov = np.eye(2, dtype=np.float32) * 0.001
+                    stab_kalman_y.processNoiseCov = np.eye(2, dtype=np.float32) * 0.001
+    
+                    # Measurement noise (how much we trust the measurements) - higher = smooth more
+                    stab_kalman_x.measurementNoiseCov = np.array([[1.0]], dtype=np.float32)
+                    stab_kalman_y.measurementNoiseCov = np.array([[1.0]], dtype=np.float32)
+    
+                # Predict next state
+                stab_kalman_x.predict()
+                stab_kalman_y.predict()
+    
+                # Correct with measurement
+                measurement_x = np.array([[dx]], dtype=np.float32)
+                measurement_y = np.array([[dy]], dtype=np.float32)
+    
+                stab_kalman_x.correct(measurement_x)
+                stab_kalman_y.correct(measurement_y)
+    
+                # Use filtered position (smoother than raw measurement)
+                dx = stab_kalman_x.statePost[0, 0]
+                dy = stab_kalman_y.statePost[0, 0]
+    
+            max_shift = min(w, h) * 0.3
+            if abs(dx) < max_shift and abs(dy) < max_shift:
+                # Use traditional accumulation and smoothing for both modes
+                # This provides better vibration filtering than direct tracking
+                stab_accumulated_x += dx
+                stab_accumulated_y += dy
+                stab_accumulated_x *= s['stab_decay'] / 100.0
+                stab_accumulated_y *= s['stab_decay'] / 100.0
+    
+                max_accum = min(w, h) * 0.5
+                stab_accumulated_x = max(-max_accum, min(max_accum, stab_accumulated_x))
+                stab_accumulated_y = max(-max_accum, min(max_accum, stab_accumulated_y))
+    
+                smooth = s['stab_smooth'] / 100.0
+                stab_smooth_correction_x = smooth * stab_smooth_correction_x + (1 - smooth) * (-stab_accumulated_x)
+                stab_smooth_correction_y = smooth * stab_smooth_correction_y + (1 - smooth) * (-stab_accumulated_y)
+    
+                # Crop-based stabilization (no motion blur!)
+                if s['stab_use_crop']:
+                    # Calculate crop size based on margin percentage
+                    margin_pct = s['stab_crop_margin'] / 100.0
+                    crop_w = int(w * (1 - margin_pct * 2))
+                    crop_h = int(h * (1 - margin_pct * 2))
+    
+                    # Calculate the center of the crop window
+                    # Start from the frame center
+                    center_x = w // 2
+                    center_y = h // 2
+    
+                    # Offset by the correction (negate to move crop window opposite of shake)
+                    # If camera shakes RIGHT, we need to crop from the RIGHT side
+                    # Keep as float for sub-pixel accuracy
+                    offset_x = -stab_smooth_correction_x
+                    offset_y = -stab_smooth_correction_y
+    
+                    # Calculate crop boundaries with float precision
+                    crop_x1_float = center_x - crop_w / 2.0 + offset_x
+                    crop_y1_float = center_y - crop_h / 2.0 + offset_y
+                    crop_x2_float = crop_x1_float + crop_w
+                    crop_y2_float = crop_y1_float + crop_h
+    
+                    # Clamp to frame boundaries
+                    crop_x1_float = max(0, min(w - crop_w, crop_x1_float))
+                    crop_y1_float = max(0, min(h - crop_h, crop_y1_float))
+                    crop_x2_float = crop_x1_float + crop_w
+                    crop_y2_float = crop_y1_float + crop_h
+    
+                    # Convert to int only for final crop extraction
+                    crop_x1 = int(crop_x1_float)
+                    crop_y1 = int(crop_y1_float)
+                    crop_x2 = int(crop_x2_float)
+                    crop_y2 = int(crop_y2_float)
+    
+                    # Extract crop and resize back to original size
+                    cropped = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                    stabilized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    # Traditional warp-based stabilization
+                    M = np.float32([[1, 0, stab_smooth_correction_x], [0, 1, stab_smooth_correction_y]])
+                    stabilized = cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+            else:
+                stab_accumulated_x = 0.0
+                stab_accumulated_y = 0.0
+                stab_smooth_correction_x = 0.0
+                stab_smooth_correction_y = 0.0
+                stab_frame_buffer = []
+                stabilized = frame.copy()
+        except:
             stabilized = frame.copy()
-    except:
-        stabilized = frame.copy()
+    
+        # Temporal blending (only for non-crop modes)
+        if not s['stab_use_crop'] and s['stab_use_ema']:
+            ema_type = s['stab_ema_type']
+    
+            if ema_type == 'regular':
+                # Regular Exponential Moving Average (lower latency but very smooth)
+                # Lower alpha = MORE smoothing (more ghosting/trails but smoother)
+                alpha = 1.0 / (s['stab_blend'] * 2)  # More aggressive than standard EMA
+                if stab_ema_frame is None:
+                    stab_ema_frame = stabilized.astype(np.float32)
+                else:
+                    stab_ema_frame = alpha * stabilized.astype(np.float32) + (1 - alpha) * stab_ema_frame
+                stabilized = stab_ema_frame.astype(np.uint8)
+    
+            elif ema_type == 'tema':
+                # Triple Exponential Moving Average (reduced lag, more responsive)
+                # TEMA = 3*EMA1 - 3*EMA2 + EMA3
+                alpha = 1.0 / (s['stab_blend'] * 2)
+                current_frame = stabilized.astype(np.float32)
+    
+                if stab_tema_ema1 is None:
+                    stab_tema_ema1 = current_frame
+                    stab_tema_ema2 = current_frame
+                    stab_tema_ema3 = current_frame
+                else:
+                    stab_tema_ema1 = alpha * current_frame + (1 - alpha) * stab_tema_ema1
+                    stab_tema_ema2 = alpha * stab_tema_ema1 + (1 - alpha) * stab_tema_ema2
+                    stab_tema_ema3 = alpha * stab_tema_ema2 + (1 - alpha) * stab_tema_ema3
+    
+                tema_result = 3 * stab_tema_ema1 - 3 * stab_tema_ema2 + stab_tema_ema3
+                stabilized = np.clip(tema_result, 0, 255).astype(np.uint8)
+    
+            elif ema_type == 'hma':
+                # Hull Moving Average (very responsive while smooth)
+                # HMA approximation: 2*EMA(short) - EMA(long)
+                alpha_short = 1.0 / (s['stab_blend'] * 1.5)  # Faster response
+                alpha_long = 1.0 / (s['stab_blend'] * 3)  # Slower response
+                current_frame = stabilized.astype(np.float32)
+    
+                if stab_hma_short is None:
+                    stab_hma_short = current_frame
+                    stab_hma_long = current_frame
+                else:
+                    stab_hma_short = alpha_short * current_frame + (1 - alpha_short) * stab_hma_short
+                    stab_hma_long = alpha_long * current_frame + (1 - alpha_long) * stab_hma_long
+    
+                hma_result = 2 * stab_hma_short - stab_hma_long
+                stabilized = np.clip(hma_result, 0, 255).astype(np.uint8)
+        elif not s['stab_use_crop']:
+            # Weighted frame blending (original method)
+            blend = s['stab_blend']
+            if blend > 1:
+                stab_frame_buffer.append(stabilized.astype(np.float32))
+                if len(stab_frame_buffer) > blend:
+                    stab_frame_buffer.pop(0)
+                if len(stab_frame_buffer) >= 2:
+                    blended = np.zeros_like(stabilized, dtype=np.float32)
+                    for i, f in enumerate(stab_frame_buffer):
+                        blended += f * (i + 1)
+                    stabilized = (blended / sum(range(1, len(stab_frame_buffer) + 1))).astype(np.uint8)
 
-    # Temporal blending (only for non-crop modes)
-    if not s['stab_use_crop'] and s['stab_use_ema']:
-        ema_type = s['stab_ema_type']
+    # Apply PCB/Circuit Board enhancements
+    enhanced = stabilized
 
-        if ema_type == 'regular':
-            # Regular Exponential Moving Average (lower latency but very smooth)
-            # Lower alpha = MORE smoothing (more ghosting/trails but smoother)
-            alpha = 1.0 / (s['stab_blend'] * 2)  # More aggressive than standard EMA
-            if stab_ema_frame is None:
-                stab_ema_frame = stabilized.astype(np.float32)
-            else:
-                stab_ema_frame = alpha * stabilized.astype(np.float32) + (1 - alpha) * stab_ema_frame
-            stabilized = stab_ema_frame.astype(np.uint8)
+    # CLAHE - Contrast Limited Adaptive Histogram Equalization (great for local details)
+    if s['enhance_clahe']:
+        # Convert to LAB color space for better contrast enhancement
+        lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        lab[:,:,0] = clahe.apply(lab[:,:,0])  # Apply only to L channel
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-        elif ema_type == 'tema':
-            # Triple Exponential Moving Average (reduced lag, more responsive)
-            # TEMA = 3*EMA1 - 3*EMA2 + EMA3
-            alpha = 1.0 / (s['stab_blend'] * 2)
-            current_frame = stabilized.astype(np.float32)
+    # Sharpening - Makes fine details (traces, vias) more visible
+    if s['enhance_sharpen']:
+        gaussian = cv2.GaussianBlur(enhanced, (0, 0), 2.0)
+        enhanced = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
 
-            if stab_tema_ema1 is None:
-                stab_tema_ema1 = current_frame
-                stab_tema_ema2 = current_frame
-                stab_tema_ema3 = current_frame
-            else:
-                stab_tema_ema1 = alpha * current_frame + (1 - alpha) * stab_tema_ema1
-                stab_tema_ema2 = alpha * stab_tema_ema1 + (1 - alpha) * stab_tema_ema2
-                stab_tema_ema3 = alpha * stab_tema_ema2 + (1 - alpha) * stab_tema_ema3
+    # Edge detection overlay - Highlights component boundaries and traces
+    if s['enhance_edges']:
+        gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        # Create colored edge overlay (cyan edges)
+        edge_overlay = np.zeros_like(enhanced)
+        edge_overlay[edges > 0] = [255, 255, 0]  # Cyan color for edges
+        enhanced = cv2.addWeighted(enhanced, 0.85, edge_overlay, 0.15, 0)
 
-            tema_result = 3 * stab_tema_ema1 - 3 * stab_tema_ema2 + stab_tema_ema3
-            stabilized = np.clip(tema_result, 0, 255).astype(np.uint8)
+    # Color inversion - Sometimes easier to see copper traces on dark background
+    if s['enhance_invert']:
+        enhanced = cv2.bitwise_not(enhanced)
 
-        elif ema_type == 'hma':
-            # Hull Moving Average (very responsive while smooth)
-            # HMA approximation: 2*EMA(short) - EMA(long)
-            alpha_short = 1.0 / (s['stab_blend'] * 1.5)  # Faster response
-            alpha_long = 1.0 / (s['stab_blend'] * 3)  # Slower response
-            current_frame = stabilized.astype(np.float32)
-
-            if stab_hma_short is None:
-                stab_hma_short = current_frame
-                stab_hma_long = current_frame
-            else:
-                stab_hma_short = alpha_short * current_frame + (1 - alpha_short) * stab_hma_short
-                stab_hma_long = alpha_long * current_frame + (1 - alpha_long) * stab_hma_long
-
-            hma_result = 2 * stab_hma_short - stab_hma_long
-            stabilized = np.clip(hma_result, 0, 255).astype(np.uint8)
-    elif not s['stab_use_crop']:
-        # Weighted frame blending (original method)
-        blend = s['stab_blend']
-        if blend > 1:
-            stab_frame_buffer.append(stabilized.astype(np.float32))
-            if len(stab_frame_buffer) > blend:
-                stab_frame_buffer.pop(0)
-            if len(stab_frame_buffer) >= 2:
-                blended = np.zeros_like(stabilized, dtype=np.float32)
-                for i, f in enumerate(stab_frame_buffer):
-                    blended += f * (i + 1)
-                stabilized = (blended / sum(range(1, len(stab_frame_buffer) + 1))).astype(np.uint8)
-
-    return stabilized
+    return enhanced
 
 def apply_processing(frame, s):
     global stab_prev_gray, stab_accumulated_x, stab_accumulated_y
@@ -591,6 +821,19 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(settings_json.encode())
 
+        elif self.path == '/motion':
+            # Return full affine transformation matrix for annotation tracking
+            with motion_lock:
+                motion_data = json.dumps({
+                    'matrix': current_motion_matrix,  # [a, b, tx, c, d, ty]
+                    'seq': motion_sequence
+                })
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            self.wfile.write(motion_data.encode())
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -662,7 +905,15 @@ class Handler(SimpleHTTPRequestHandler):
                         settings['use_lanczos'] = not settings['use_lanczos']
                     elif setting == 'use_ai_upscale' and value == 'toggle':
                         settings['use_ai_upscale'] = not settings['use_ai_upscale']
-            
+                    elif setting == 'enhance_clahe' and value == 'toggle':
+                        settings['enhance_clahe'] = not settings['enhance_clahe']
+                    elif setting == 'enhance_edges' and value == 'toggle':
+                        settings['enhance_edges'] = not settings['enhance_edges']
+                    elif setting == 'enhance_sharpen' and value == 'toggle':
+                        settings['enhance_sharpen'] = not settings['enhance_sharpen']
+                    elif setting == 'enhance_invert' and value == 'toggle':
+                        settings['enhance_invert'] = not settings['enhance_invert']
+
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()

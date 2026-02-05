@@ -210,6 +210,16 @@
             image-rendering: auto;
             transition: transform 0.1s ease-out;
         }
+        #annotation-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            cursor: crosshair;
+        }
+        #annotation-canvas.drawing-enabled {
+            pointer-events: auto;
+        }
         .info {
             position: absolute;
             bottom: 30px;
@@ -352,6 +362,60 @@
             </div>
 
             <div class="control-group">
+                <h3>PCB Enhancement</h3>
+                <p style="font-size: 11px; color: #666; margin: 0 0 10px 0;">
+                    Optimized for circuit boards, traces, and microchips
+                </p>
+                <div class="button-group">
+                    <button id="clahe-btn" onclick="toggleCLAHE()">CLAHE: ON</button>
+                    <button id="sharpen-btn" onclick="toggleSharpen()">Sharpen: ON</button>
+                </div>
+                <div class="button-group" style="margin-top: 10px;">
+                    <button id="edges-btn" onclick="toggleEdges()">Edges: OFF</button>
+                    <button id="invert-btn" onclick="toggleInvert()">Invert: OFF</button>
+                </div>
+                <p style="font-size: 10px; color: #555; margin: 10px 0 0 0;">
+                    <strong>CLAHE:</strong> Local contrast • <strong>Sharpen:</strong> Fine details<br>
+                    <strong>Edges:</strong> Trace overlay • <strong>Invert:</strong> Dark background
+                </p>
+
+                <div style="margin-top: 15px; padding: 10px; background: #1a1a1a; border-radius: 6px; border: 1px solid #333;">
+                    <h4 style="margin: 0 0 10px 0; font-size: 12px; color: #999;">Annotation Drawing</h4>
+                    <div class="button-group">
+                        <button id="drawing-btn" onclick="toggleDrawing()" style="grid-column: 1 / -1;">Drawing: OFF (D)</button>
+                    </div>
+                    <div id="drawing-tools" style="display: none; margin-top: 10px;">
+                        <div style="margin-bottom: 8px;">
+                            <label style="font-size: 11px; color: #ccc; display: block; margin-bottom: 4px;">Color:</label>
+                            <div style="display: flex; gap: 6px;">
+                                <button onclick="setDrawColor('#ff0000')" style="width: 30px; height: 30px; background: #ff0000; border: 2px solid #333; border-radius: 4px;"></button>
+                                <button onclick="setDrawColor('#00ff00')" style="width: 30px; height: 30px; background: #00ff00; border: 2px solid #333; border-radius: 4px;"></button>
+                                <button onclick="setDrawColor('#0000ff')" style="width: 30px; height: 30px; background: #0000ff; border: 2px solid #333; border-radius: 4px;"></button>
+                                <button onclick="setDrawColor('#ffff00')" style="width: 30px; height: 30px; background: #ffff00; border: 2px solid #333; border-radius: 4px;"></button>
+                                <button onclick="setDrawColor('#ffffff')" style="width: 30px; height: 30px; background: #ffffff; border: 2px solid #333; border-radius: 4px;"></button>
+                            </div>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <label style="font-size: 11px; color: #ccc;">Line Width: <span id="linewidth-value">3</span>px</label>
+                            <input type="range" id="linewidth-slider" min="1" max="10" value="3" step="1" oninput="setLineWidth(this.value)" style="width: 100%;">
+                        </div>
+                        <div class="button-group">
+                            <button onclick="clearAnnotations()">Clear All</button>
+                        </div>
+                    </div>
+                    <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #333;">
+                        <button id="adjust-btn" onclick="toggleAdjustMode()" style="width: 100%; margin-bottom: 8px;">Adjust Mode: OFF (A)</button>
+                        <p style="font-size: 9px; color: #666; margin: 0;">
+                            <strong>Adjust Mode:</strong> Drag to move, Shift+drag to rotate
+                        </p>
+                    </div>
+                    <p style="font-size: 9px; color: #666; margin: 8px 0 0 0;">
+                        Draw on the image - annotations track with camera movement
+                    </p>
+                </div>
+            </div>
+
+            <div class="control-group">
                 <h3>Stabilization</h3>
                 <div class="button-group">
                     <button id="stabilize-btn" onclick="toggleStabilize()">Stabilize: OFF</button>
@@ -460,6 +524,7 @@
             <div class="image-container">
                 <div class="image-wrapper">
                     <img id="microscope-image" src="/stream.mjpg" alt="Microscope feed">
+                    <canvas id="annotation-canvas"></canvas>
                 </div>
                 <div class="info">
                     Processed in Python • <span class="fps" id="actual-fps">-- FPS</span>
@@ -772,6 +837,52 @@
                         'AI Upscale: ' + (aiUpscaleEnabled ? 'ON' : 'OFF');
                 })
                 .catch(err => console.error('Failed to toggle AI upscale:', err));
+        }
+
+        // PCB Enhancement toggles
+        let claheEnabled = true;
+        let edgesEnabled = false;
+        let sharpenEnabled = true;
+        let invertEnabled = false;
+
+        function toggleCLAHE() {
+            fetch('/process/enhance_clahe/toggle', { method: 'POST' })
+                .then(response => {
+                    claheEnabled = !claheEnabled;
+                    document.getElementById('clahe-btn').textContent =
+                        'CLAHE: ' + (claheEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to toggle CLAHE:', err));
+        }
+
+        function toggleEdges() {
+            fetch('/process/enhance_edges/toggle', { method: 'POST' })
+                .then(response => {
+                    edgesEnabled = !edgesEnabled;
+                    document.getElementById('edges-btn').textContent =
+                        'Edges: ' + (edgesEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to toggle edges:', err));
+        }
+
+        function toggleSharpen() {
+            fetch('/process/enhance_sharpen/toggle', { method: 'POST' })
+                .then(response => {
+                    sharpenEnabled = !sharpenEnabled;
+                    document.getElementById('sharpen-btn').textContent =
+                        'Sharpen: ' + (sharpenEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to toggle sharpen:', err));
+        }
+
+        function toggleInvert() {
+            fetch('/process/enhance_invert/toggle', { method: 'POST' })
+                .then(response => {
+                    invertEnabled = !invertEnabled;
+                    document.getElementById('invert-btn').textContent =
+                        'Invert: ' + (invertEnabled ? 'ON' : 'OFF');
+                })
+                .catch(err => console.error('Failed to toggle invert:', err));
         }
 
         let currentEMAType = 'regular';
@@ -1176,12 +1287,399 @@
 
                     aiUpscaleEnabled = settings.use_ai_upscale;
                     document.getElementById('ai-upscale-btn').textContent = 'AI Upscale: ' + (aiUpscaleEnabled ? 'ON' : 'OFF');
+
+                    // Update PCB enhancement buttons
+                    claheEnabled = settings.enhance_clahe;
+                    document.getElementById('clahe-btn').textContent = 'CLAHE: ' + (claheEnabled ? 'ON' : 'OFF');
+
+                    edgesEnabled = settings.enhance_edges;
+                    document.getElementById('edges-btn').textContent = 'Edges: ' + (edgesEnabled ? 'ON' : 'OFF');
+
+                    sharpenEnabled = settings.enhance_sharpen;
+                    document.getElementById('sharpen-btn').textContent = 'Sharpen: ' + (sharpenEnabled ? 'ON' : 'OFF');
+
+                    invertEnabled = settings.enhance_invert;
+                    document.getElementById('invert-btn').textContent = 'Invert: ' + (invertEnabled ? 'ON' : 'OFF');
                 })
                 .catch(err => console.error('Failed to sync settings:', err));
         }
 
         // Load settings when page loads
         window.addEventListener('load', syncSettings);
+
+        // ========== Annotation Drawing and Tracking ==========
+        const annotationCanvas = document.getElementById('annotation-canvas');
+        const annotationCtx = annotationCanvas.getContext('2d');
+        const microscopeImg = document.getElementById('microscope-image');
+
+        let drawingEnabled = false;
+        let isDrawing = false;
+        let currentStroke = null;
+        let strokes = [];  // Array of strokes, each stroke is an array of {x, y} points
+        let drawColor = '#ff0000';
+        let lineWidth = 3;
+
+        // Adjust mode for manual repositioning
+        let adjustMode = false;
+        let isAdjusting = false;
+        let adjustStartPos = null;
+        let adjustStartStrokes = null;
+
+        // Resize canvas to match image
+        function resizeAnnotationCanvas() {
+            const rect = microscopeImg.getBoundingClientRect();
+            annotationCanvas.width = microscopeImg.naturalWidth || rect.width;
+            annotationCanvas.height = microscopeImg.naturalHeight || rect.height;
+            annotationCanvas.style.width = rect.width + 'px';
+            annotationCanvas.style.height = rect.height + 'px';
+            redrawAnnotations();
+        }
+
+        // Watch for image load and resize
+        microscopeImg.addEventListener('load', resizeAnnotationCanvas);
+        window.addEventListener('resize', resizeAnnotationCanvas);
+        setTimeout(resizeAnnotationCanvas, 100);  // Initial setup
+
+        // Toggle drawing mode
+        function toggleDrawing() {
+            drawingEnabled = !drawingEnabled;
+            document.getElementById('drawing-btn').textContent = 'Drawing: ' + (drawingEnabled ? 'ON' : 'OFF') + ' (D)';
+            document.getElementById('drawing-tools').style.display = drawingEnabled ? 'block' : 'none';
+            if (drawingEnabled) {
+                // Turn off adjust mode when drawing
+                if (adjustMode) {
+                    toggleAdjustMode();
+                }
+                annotationCanvas.classList.add('drawing-enabled');
+            } else {
+                annotationCanvas.classList.remove('drawing-enabled');
+            }
+        }
+
+        // Set drawing color
+        function setDrawColor(color) {
+            drawColor = color;
+        }
+
+        // Set line width
+        function setLineWidth(width) {
+            lineWidth = parseInt(width);
+            document.getElementById('linewidth-value').textContent = width;
+        }
+
+        // Clear all annotations
+        function clearAnnotations() {
+            strokes = [];
+            redrawAnnotations();
+        }
+
+        // Toggle adjust mode
+        function toggleAdjustMode() {
+            adjustMode = !adjustMode;
+            document.getElementById('adjust-btn').textContent = 'Adjust Mode: ' + (adjustMode ? 'ON' : 'OFF') + ' (A)';
+            if (adjustMode) {
+                // Turn off drawing when adjusting
+                if (drawingEnabled) {
+                    toggleDrawing();
+                }
+                annotationCanvas.classList.add('drawing-enabled');
+                annotationCanvas.style.cursor = 'move';
+            } else {
+                annotationCanvas.classList.remove('drawing-enabled');
+                annotationCanvas.style.cursor = 'crosshair';
+            }
+        }
+
+        // Manual adjustment functions
+        function startAdjust(clientX, clientY, isRotate) {
+            if (!adjustMode || strokes.length === 0) return false;
+
+            isAdjusting = true;
+            const pos = getCanvasCoords(clientX, clientY);
+            adjustStartPos = { x: pos.x, y: pos.y, isRotate: isRotate };
+
+            // Deep clone current stroke positions
+            adjustStartStrokes = JSON.parse(JSON.stringify(strokes));
+            return true;
+        }
+
+        function continueAdjust(clientX, clientY) {
+            if (!isAdjusting || !adjustStartPos) return;
+
+            const pos = getCanvasCoords(clientX, clientY);
+
+            if (adjustStartPos.isRotate) {
+                // Rotate mode: calculate angle from start to current position
+                const centerX = annotationCanvas.width / 2;
+                const centerY = annotationCanvas.height / 2;
+
+                const startAngle = Math.atan2(adjustStartPos.y - centerY, adjustStartPos.x - centerX);
+                const currentAngle = Math.atan2(pos.y - centerY, pos.x - centerX);
+                const deltaAngle = currentAngle - startAngle;
+
+                const cosA = Math.cos(deltaAngle);
+                const sinA = Math.sin(deltaAngle);
+
+                // Rotate all strokes around center
+                adjustStartStrokes.forEach((originalStroke, i) => {
+                    strokes[i].points.forEach((point, j) => {
+                        const origPoint = originalStroke.points[j];
+                        const x = origPoint.x - centerX;
+                        const y = origPoint.y - centerY;
+
+                        point.x = x * cosA - y * sinA + centerX;
+                        point.y = x * sinA + y * cosA + centerY;
+                    });
+                });
+            } else {
+                // Translate mode: move by delta
+                const dx = pos.x - adjustStartPos.x;
+                const dy = pos.y - adjustStartPos.y;
+
+                adjustStartStrokes.forEach((originalStroke, i) => {
+                    strokes[i].points.forEach((point, j) => {
+                        const origPoint = originalStroke.points[j];
+                        point.x = origPoint.x + dx;
+                        point.y = origPoint.y + dy;
+                    });
+                });
+            }
+
+            redrawAnnotations();
+        }
+
+        function endAdjust() {
+            isAdjusting = false;
+            adjustStartPos = null;
+            adjustStartStrokes = null;
+        }
+
+        // Convert screen coordinates to canvas coordinates
+        function getCanvasCoords(clientX, clientY) {
+            const rect = annotationCanvas.getBoundingClientRect();
+            const scaleX = annotationCanvas.width / rect.width;
+            const scaleY = annotationCanvas.height / rect.height;
+            return {
+                x: (clientX - rect.left) * scaleX,
+                y: (clientY - rect.top) * scaleY
+            };
+        }
+
+        // Mouse/touch event handlers
+        annotationCanvas.addEventListener('mousedown', (e) => {
+            // Check adjust mode first
+            if (adjustMode) {
+                if (startAdjust(e.clientX, e.clientY, e.shiftKey)) {
+                    e.preventDefault();
+                }
+                return;
+            }
+
+            if (!drawingEnabled) return;
+            isDrawing = true;
+            const pos = getCanvasCoords(e.clientX, e.clientY);
+            currentStroke = {
+                points: [pos],
+                color: drawColor,
+                width: lineWidth
+            };
+        });
+
+        annotationCanvas.addEventListener('mousemove', (e) => {
+            // Check adjust mode first
+            if (adjustMode && isAdjusting) {
+                continueAdjust(e.clientX, e.clientY);
+                e.preventDefault();
+                return;
+            }
+
+            if (!drawingEnabled || !isDrawing) return;
+            const pos = getCanvasCoords(e.clientX, e.clientY);
+            currentStroke.points.push(pos);
+            redrawAnnotations();
+        });
+
+        annotationCanvas.addEventListener('mouseup', () => {
+            // Check adjust mode first
+            if (adjustMode && isAdjusting) {
+                endAdjust();
+                return;
+            }
+
+            if (!drawingEnabled || !isDrawing) return;
+            isDrawing = false;
+            if (currentStroke && currentStroke.points.length > 0) {
+                strokes.push(currentStroke);
+            }
+            currentStroke = null;
+        });
+
+        annotationCanvas.addEventListener('mouseleave', () => {
+            if (isAdjusting) {
+                endAdjust();
+            }
+            if (isDrawing) {
+                isDrawing = false;
+                if (currentStroke && currentStroke.points.length > 0) {
+                    strokes.push(currentStroke);
+                }
+                currentStroke = null;
+            }
+        });
+
+        // Touch support
+        annotationCanvas.addEventListener('touchstart', (e) => {
+            // Check adjust mode first (2-finger touch = rotate)
+            if (adjustMode) {
+                e.preventDefault();
+                const touch = e.touches[0];
+                startAdjust(touch.clientX, touch.clientY, e.touches.length > 1);
+                return;
+            }
+
+            if (!drawingEnabled) return;
+            e.preventDefault();
+            const touch = e.touches[0];
+            isDrawing = true;
+            const pos = getCanvasCoords(touch.clientX, touch.clientY);
+            currentStroke = {
+                points: [pos],
+                color: drawColor,
+                width: lineWidth
+            };
+        });
+
+        annotationCanvas.addEventListener('touchmove', (e) => {
+            // Check adjust mode first
+            if (adjustMode && isAdjusting) {
+                e.preventDefault();
+                const touch = e.touches[0];
+                continueAdjust(touch.clientX, touch.clientY);
+                return;
+            }
+
+            if (!drawingEnabled || !isDrawing) return;
+            e.preventDefault();
+            const touch = e.touches[0];
+            const pos = getCanvasCoords(touch.clientX, touch.clientY);
+            currentStroke.points.push(pos);
+            redrawAnnotations();
+        });
+
+        annotationCanvas.addEventListener('touchend', (e) => {
+            // Check adjust mode first
+            if (adjustMode && isAdjusting) {
+                e.preventDefault();
+                endAdjust();
+                return;
+            }
+
+            if (!drawingEnabled || !isDrawing) return;
+            e.preventDefault();
+            isDrawing = false;
+            if (currentStroke && currentStroke.points.length > 0) {
+                strokes.push(currentStroke);
+            }
+            currentStroke = null;
+        });
+
+        // Redraw all annotations
+        function redrawAnnotations() {
+            annotationCtx.clearRect(0, 0, annotationCanvas.width, annotationCanvas.height);
+
+            // Draw completed strokes
+            strokes.forEach(stroke => {
+                if (stroke.points.length < 2) return;
+                annotationCtx.strokeStyle = stroke.color;
+                annotationCtx.lineWidth = stroke.width;
+                annotationCtx.lineCap = 'round';
+                annotationCtx.lineJoin = 'round';
+                annotationCtx.beginPath();
+                annotationCtx.moveTo(stroke.points[0].x, stroke.points[0].y);
+                for (let i = 1; i < stroke.points.length; i++) {
+                    annotationCtx.lineTo(stroke.points[i].x, stroke.points[i].y);
+                }
+                annotationCtx.stroke();
+            });
+
+            // Draw current stroke being drawn
+            if (currentStroke && currentStroke.points.length > 0) {
+                annotationCtx.strokeStyle = currentStroke.color;
+                annotationCtx.lineWidth = currentStroke.width;
+                annotationCtx.lineCap = 'round';
+                annotationCtx.lineJoin = 'round';
+                annotationCtx.beginPath();
+                annotationCtx.moveTo(currentStroke.points[0].x, currentStroke.points[0].y);
+                for (let i = 1; i < currentStroke.points.length; i++) {
+                    annotationCtx.lineTo(currentStroke.points[i].x, currentStroke.points[i].y);
+                }
+                annotationCtx.stroke();
+            }
+        }
+
+        // Motion tracking for annotations - high frequency for fast movements
+        let lastMotionSeq = -1;
+        async function updateAnnotationPositions() {
+            if (strokes.length === 0) return;
+
+            try {
+                const response = await fetch('/motion');
+                const motion = await response.json();
+
+                // Only apply motion if this is a new frame (sequence number changed)
+                // This prevents applying the same motion multiple times
+                if (motion.seq !== lastMotionSeq) {
+                    lastMotionSeq = motion.seq;
+
+                    // Apply full affine transformation to make annotations track perfectly
+                    // Matrix format: [a, b, tx, c, d, ty]
+                    // Transform: x' = a*x + b*y + tx, y' = c*x + d*y + ty
+                    const [a, b, tx, c, d, ty] = motion.matrix;
+
+                    // Check if there's any transformation (not identity matrix)
+                    if (Math.abs(tx) > 0.01 || Math.abs(ty) > 0.01 ||
+                        Math.abs(a - 1.0) > 0.001 || Math.abs(d - 1.0) > 0.001 ||
+                        Math.abs(b) > 0.001 || Math.abs(c) > 0.001) {
+
+                        strokes.forEach(stroke => {
+                            stroke.points.forEach(point => {
+                                const oldX = point.x;
+                                const oldY = point.y;
+
+                                // Apply affine transformation
+                                point.x = a * oldX + b * oldY + tx;
+                                point.y = c * oldX + d * oldY + ty;
+                            });
+                        });
+                        redrawAnnotations();
+                    }
+                }
+            } catch (err) {
+                // Silently ignore errors
+            }
+        }
+
+        // Start motion tracking loop at 60fps for fast jerky movements
+        setInterval(updateAnnotationPositions, 16);
+
+        // Keyboard shortcuts for drawing and adjust modes
+        document.addEventListener('keydown', (e) => {
+            // Ignore if typing in an input field
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+                return;
+            }
+
+            const key = e.key.toLowerCase();
+
+            if (key === 'd') {
+                e.preventDefault();
+                toggleDrawing();
+            } else if (key === 'a') {
+                e.preventDefault();
+                toggleAdjustMode();
+            }
+        });
+
     </script>
 </body>
 </html>
