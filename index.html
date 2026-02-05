@@ -382,9 +382,9 @@
                 <div style="margin-top: 15px; padding: 10px; background: #1a1a1a; border-radius: 6px; border: 1px solid #333;">
                     <h4 style="margin: 0 0 10px 0; font-size: 12px; color: #999;">Annotation Drawing</h4>
                     <div class="button-group">
-                        <button id="drawing-btn" onclick="toggleDrawing()" style="grid-column: 1 / -1;">Drawing: OFF (D)</button>
+                        <button id="drawing-btn" onclick="toggleDrawing()" style="grid-column: 1 / -1;">Drawing: ON (D)</button>
                     </div>
-                    <div id="drawing-tools" style="display: none; margin-top: 10px;">
+                    <div id="drawing-tools" style="display: block; margin-top: 10px;">
                         <div style="margin-bottom: 8px;">
                             <label style="font-size: 11px; color: #ccc; display: block; margin-bottom: 4px;">Color:</label>
                             <div style="display: flex; gap: 6px;">
@@ -400,7 +400,7 @@
                             <input type="range" id="linewidth-slider" min="1" max="10" value="3" step="1" oninput="setLineWidth(this.value)" style="width: 100%;">
                         </div>
                         <div class="button-group">
-                            <button onclick="clearAnnotations()">Clear All</button>
+                            <button onclick="clearAnnotations()">Undo Last (C)</button>
                         </div>
                     </div>
                     <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #333;">
@@ -524,7 +524,7 @@
             <div class="image-container">
                 <div class="image-wrapper">
                     <img id="microscope-image" src="/stream.mjpg" alt="Microscope feed">
-                    <canvas id="annotation-canvas"></canvas>
+                    <canvas id="annotation-canvas" class="drawing-enabled"></canvas>
                 </div>
                 <div class="info">
                     Processed in Python • <span class="fps" id="actual-fps">-- FPS</span>
@@ -1090,19 +1090,45 @@
         }
 
         function takeScreenshot() {
-            // Fetch current processed frame from server
-            fetch('/current.jpg')
-                .then(response => response.blob())
-                .then(blob => {
+            try {
+                // Create a temporary canvas to composite image + annotations
+                const tempCanvas = document.createElement('canvas');
+                const tempCtx = tempCanvas.getContext('2d');
+                const img = document.getElementById('microscope-image');
+
+                // Set canvas size to match image
+                tempCanvas.width = img.naturalWidth || img.width;
+                tempCanvas.height = img.naturalHeight || img.height;
+
+                // Draw the microscope image
+                tempCtx.drawImage(img, 0, 0, tempCanvas.width, tempCanvas.height);
+
+                // Draw annotations on top if they exist
+                if (annotationCanvas && strokes.length > 0) {
+                    // Scale annotations to match the full resolution
+                    const scaleX = tempCanvas.width / annotationCanvas.width;
+                    const scaleY = tempCanvas.height / annotationCanvas.height;
+
+                    tempCtx.save();
+                    tempCtx.scale(scaleX, scaleY);
+                    tempCtx.drawImage(annotationCanvas, 0, 0);
+                    tempCtx.restore();
+                }
+
+                // Convert to blob and download
+                tempCanvas.toBlob(blob => {
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
-                    a.href = url;
                     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
                     a.download = `microscope_${timestamp}.jpg`;
+                    a.href = url;
                     a.click();
                     URL.revokeObjectURL(url);
-                })
-                .catch(err => console.error('Failed to take screenshot:', err));
+                }, 'image/jpeg', 0.95);
+            } catch (err) {
+                console.error('Failed to take screenshot:', err);
+                alert('Failed to take screenshot: ' + err.message);
+            }
         }
 
         // Video recording functionality
@@ -1133,6 +1159,18 @@
                 function drawFrame() {
                     ctx.clearRect(0, 0, canvas.width, canvas.height);
                     ctx.drawImage(img, 0, 0);
+
+                    // Draw annotations on top if they exist
+                    if (annotationCanvas && strokes.length > 0) {
+                        // Scale annotations to match the recording canvas
+                        const scaleX = canvas.width / annotationCanvas.width;
+                        const scaleY = canvas.height / annotationCanvas.height;
+
+                        ctx.save();
+                        ctx.scale(scaleX, scaleY);
+                        ctx.drawImage(annotationCanvas, 0, 0);
+                        ctx.restore();
+                    }
 
                     if (mediaRecorder && mediaRecorder.state === 'recording') {
                         animationId = requestAnimationFrame(drawFrame);
@@ -1312,7 +1350,7 @@
         const annotationCtx = annotationCanvas.getContext('2d');
         const microscopeImg = document.getElementById('microscope-image');
 
-        let drawingEnabled = false;
+        let drawingEnabled = true;  // ON by default
         let isDrawing = false;
         let currentStroke = null;
         let strokes = [];  // Array of strokes, each stroke is an array of {x, y} points
@@ -1324,6 +1362,7 @@
         let isAdjusting = false;
         let adjustStartPos = null;
         let adjustStartStrokes = null;
+        let selectedStrokeIndex = -1;  // Index of stroke being adjusted
 
         // Resize canvas to match image
         function resizeAnnotationCanvas() {
@@ -1367,10 +1406,12 @@
             document.getElementById('linewidth-value').textContent = width;
         }
 
-        // Clear all annotations
+        // Undo last annotation (remove most recent stroke)
         function clearAnnotations() {
-            strokes = [];
-            redrawAnnotations();
+            if (strokes.length > 0) {
+                strokes.pop();  // Remove last stroke
+                redrawAnnotations();
+            }
         }
 
         // Toggle adjust mode
@@ -1385,33 +1426,72 @@
                 annotationCanvas.classList.add('drawing-enabled');
                 annotationCanvas.style.cursor = 'move';
             } else {
+                selectedStrokeIndex = -1;  // Clear selection
                 annotationCanvas.classList.remove('drawing-enabled');
                 annotationCanvas.style.cursor = 'crosshair';
+                redrawAnnotations();  // Clear selection highlight
             }
+        }
+
+        // Find stroke closest to click point
+        function findStrokeAtPoint(clickX, clickY) {
+            const threshold = 20;  // Maximum distance in pixels to select a stroke
+            let closestStroke = -1;
+            let closestDistance = Infinity;
+
+            strokes.forEach((stroke, strokeIndex) => {
+                stroke.points.forEach(point => {
+                    const dx = point.x - clickX;
+                    const dy = point.y - clickY;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+
+                    if (distance < closestDistance && distance < threshold) {
+                        closestDistance = distance;
+                        closestStroke = strokeIndex;
+                    }
+                });
+            });
+
+            return closestStroke;
         }
 
         // Manual adjustment functions
         function startAdjust(clientX, clientY, isRotate) {
             if (!adjustMode || strokes.length === 0) return false;
 
-            isAdjusting = true;
             const pos = getCanvasCoords(clientX, clientY);
+
+            // Find which stroke was clicked
+            selectedStrokeIndex = findStrokeAtPoint(pos.x, pos.y);
+            if (selectedStrokeIndex === -1) {
+                return false;  // No stroke near click point
+            }
+
+            isAdjusting = true;
             adjustStartPos = { x: pos.x, y: pos.y, isRotate: isRotate };
 
-            // Deep clone current stroke positions
-            adjustStartStrokes = JSON.parse(JSON.stringify(strokes));
+            // Clone only the selected stroke
+            adjustStartStrokes = JSON.parse(JSON.stringify([strokes[selectedStrokeIndex]]));
+            redrawAnnotations();  // Redraw to show selection
             return true;
         }
 
         function continueAdjust(clientX, clientY) {
-            if (!isAdjusting || !adjustStartPos) return;
+            if (!isAdjusting || !adjustStartPos || selectedStrokeIndex === -1) return;
 
             const pos = getCanvasCoords(clientX, clientY);
+            const originalStroke = adjustStartStrokes[0];  // We only saved one stroke
+            const currentStroke = strokes[selectedStrokeIndex];
 
             if (adjustStartPos.isRotate) {
-                // Rotate mode: calculate angle from start to current position
-                const centerX = annotationCanvas.width / 2;
-                const centerY = annotationCanvas.height / 2;
+                // Calculate center of the selected stroke
+                let centerX = 0, centerY = 0;
+                originalStroke.points.forEach(p => {
+                    centerX += p.x;
+                    centerY += p.y;
+                });
+                centerX /= originalStroke.points.length;
+                centerY /= originalStroke.points.length;
 
                 const startAngle = Math.atan2(adjustStartPos.y - centerY, adjustStartPos.x - centerX);
                 const currentAngle = Math.atan2(pos.y - centerY, pos.x - centerX);
@@ -1420,28 +1500,24 @@
                 const cosA = Math.cos(deltaAngle);
                 const sinA = Math.sin(deltaAngle);
 
-                // Rotate all strokes around center
-                adjustStartStrokes.forEach((originalStroke, i) => {
-                    strokes[i].points.forEach((point, j) => {
-                        const origPoint = originalStroke.points[j];
-                        const x = origPoint.x - centerX;
-                        const y = origPoint.y - centerY;
+                // Rotate only the selected stroke around its center
+                currentStroke.points.forEach((point, j) => {
+                    const origPoint = originalStroke.points[j];
+                    const x = origPoint.x - centerX;
+                    const y = origPoint.y - centerY;
 
-                        point.x = x * cosA - y * sinA + centerX;
-                        point.y = x * sinA + y * cosA + centerY;
-                    });
+                    point.x = x * cosA - y * sinA + centerX;
+                    point.y = x * sinA + y * cosA + centerY;
                 });
             } else {
                 // Translate mode: move by delta
                 const dx = pos.x - adjustStartPos.x;
                 const dy = pos.y - adjustStartPos.y;
 
-                adjustStartStrokes.forEach((originalStroke, i) => {
-                    strokes[i].points.forEach((point, j) => {
-                        const origPoint = originalStroke.points[j];
-                        point.x = origPoint.x + dx;
-                        point.y = origPoint.y + dy;
-                    });
+                currentStroke.points.forEach((point, j) => {
+                    const origPoint = originalStroke.points[j];
+                    point.x = origPoint.x + dx;
+                    point.y = origPoint.y + dy;
                 });
             }
 
@@ -1452,6 +1528,8 @@
             isAdjusting = false;
             adjustStartPos = null;
             adjustStartStrokes = null;
+            selectedStrokeIndex = -1;
+            redrawAnnotations();  // Clear selection highlight
         }
 
         // Convert screen coordinates to canvas coordinates
@@ -1588,8 +1666,27 @@
             annotationCtx.clearRect(0, 0, annotationCanvas.width, annotationCanvas.height);
 
             // Draw completed strokes
-            strokes.forEach(stroke => {
+            strokes.forEach((stroke, index) => {
                 if (stroke.points.length < 2) return;
+
+                // Highlight selected stroke in adjust mode
+                const isSelected = adjustMode && index === selectedStrokeIndex;
+
+                if (isSelected) {
+                    // Draw selection outline (thicker, semi-transparent white)
+                    annotationCtx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+                    annotationCtx.lineWidth = stroke.width + 4;
+                    annotationCtx.lineCap = 'round';
+                    annotationCtx.lineJoin = 'round';
+                    annotationCtx.beginPath();
+                    annotationCtx.moveTo(stroke.points[0].x, stroke.points[0].y);
+                    for (let i = 1; i < stroke.points.length; i++) {
+                        annotationCtx.lineTo(stroke.points[i].x, stroke.points[i].y);
+                    }
+                    annotationCtx.stroke();
+                }
+
+                // Draw the actual stroke
                 annotationCtx.strokeStyle = stroke.color;
                 annotationCtx.lineWidth = stroke.width;
                 annotationCtx.lineCap = 'round';
@@ -1677,6 +1774,9 @@
             } else if (key === 'a') {
                 e.preventDefault();
                 toggleAdjustMode();
+            } else if (key === 'c') {
+                e.preventDefault();
+                clearAnnotations();
             }
         });
 
