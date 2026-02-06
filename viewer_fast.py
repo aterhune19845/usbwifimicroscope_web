@@ -36,7 +36,7 @@ settings = {
     'zoom': 1.0,
     'use_lanczos': True,       # High-quality Lanczos upscaling when zooming
     'use_ai_upscale': False,   # AI super-resolution (slower but best quality)
-    'stabilize': False,
+    'stabilize': True,         # Stabilization ON by default
     'stab_noise': 0,       # Noise filter OFF
     'stab_smooth': 0,      # Smoothing OFF
     'stab_decay': 0,       # Decay OFF (not used in crop mode)
