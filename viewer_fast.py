@@ -39,15 +39,15 @@ settings = {
     'stabilize': False,
     'stab_noise': 0,       # Noise filter OFF
     'stab_smooth': 0,      # Smoothing OFF
-    'stab_decay': 0,       # Decay OFF
-    'stab_blend': 3,       # Frame blending
-    'stab_use_lowpass': False,   # Low-pass OFF
-    'stab_use_kalman': False,   # Kalman OFF
-    'stab_use_ema': False,     # EMA blending OFF
-    'stab_ema_type': 'regular',  # EMA type: 'regular', 'tema', 'hma'
-    'stab_use_crop': False,     # Warp mode (better for panning)
-    'stab_lowpass_alpha': 0,   # Low-pass strength OFF
-    'stab_crop_margin': 10,      # Crop margin percentage (5-15%)
+    'stab_decay': 0,       # Decay OFF (not used in crop mode)
+    'stab_blend': 3,       # Frame blending (not used in crop mode)
+    'stab_use_lowpass': False,   # Low-pass OFF (not used in crop mode)
+    'stab_use_kalman': False,   # Kalman OFF (not used in crop mode)
+    'stab_use_ema': False,     # EMA blending OFF (not used in crop mode)
+    'stab_ema_type': 'regular',  # EMA type (not used in crop mode)
+    'stab_use_crop': True,      # Crop mode ON by default
+    'stab_lowpass_alpha': 0,   # Low-pass strength OFF (not used in crop mode)
+    'stab_crop_margin': 10,      # Crop margin percentage (3-15%) - lower = less zoom artifacts
     # PCB/Circuit Board Enhancement
     'enhance_clahe': True,      # CLAHE contrast enhancement (ON by default - helps tracking!)
     'enhance_edges': False,     # Edge detection overlay
@@ -203,7 +203,9 @@ def apply_stabilization(frame, s):
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    if s['track_annotations']:
+    # Disable annotation tracking when crop stabilization is active
+    # (annotations stay static relative to stabilized image)
+    if s['track_annotations'] and not (s['stabilize'] and s['stab_use_crop']):
         if tracking_prev_gray is not None and tracking_prev_gray.shape == gray.shape:
             try:
                 # If we don't have tracking points or too few remain, detect new ones
@@ -491,9 +493,24 @@ def apply_stabilization(frame, s):
                 # This provides better vibration filtering than direct tracking
                 stab_accumulated_x += dx
                 stab_accumulated_y += dy
-                stab_accumulated_x *= s['stab_decay'] / 100.0
-                stab_accumulated_y *= s['stab_decay'] / 100.0
-    
+
+                # Apply decay only in warp mode (crop mode doesn't need it - bounded by margin)
+                if not s['stab_use_crop']:
+                    stab_accumulated_x *= s['stab_decay'] / 100.0
+                    stab_accumulated_y *= s['stab_decay'] / 100.0
+
+                # Detect intentional panning in crop mode: reset when offset gets large
+                # This prevents the "sliding" effect when user intentionally moves the camera
+                if s['stab_use_crop']:
+                    # For crop mode, check if we're approaching the margin limit
+                    margin_pct = s['stab_crop_margin'] / 100.0
+                    max_allowed = min(w, h) * margin_pct * 0.7  # Use 70% of margin as threshold
+
+                    if abs(stab_accumulated_x) > max_allowed or abs(stab_accumulated_y) > max_allowed:
+                        # Sustained motion detected - likely intentional panning, reset accumulation
+                        stab_accumulated_x *= 0.2  # Aggressive reset to follow intentional motion
+                        stab_accumulated_y *= 0.2
+
                 max_accum = min(w, h) * 0.5
                 stab_accumulated_x = max(-max_accum, min(max_accum, stab_accumulated_x))
                 stab_accumulated_y = max(-max_accum, min(max_accum, stab_accumulated_y))
@@ -514,33 +531,30 @@ def apply_stabilization(frame, s):
                     center_x = w // 2
                     center_y = h // 2
     
-                    # Offset by the correction (negate to move crop window opposite of shake)
-                    # If camera shakes RIGHT, we need to crop from the RIGHT side
+                    # In crop mode, shift window to FOLLOW the content (opposite of warp mode)
+                    # If camera shakes RIGHT, content moves RIGHT, crop window follows RIGHT
                     # Keep as float for sub-pixel accuracy
                     offset_x = -stab_smooth_correction_x
                     offset_y = -stab_smooth_correction_y
+
+                    # Debug: Print stabilization values
+                    if abs(dx) > 0.5 or abs(dy) > 0.5:
+                        print(f"Motion: dx={dx:.2f} dy={dy:.2f} | Accum: x={stab_accumulated_x:.2f} y={stab_accumulated_y:.2f} | Correction: x={stab_smooth_correction_x:.2f} y={stab_smooth_correction_y:.2f} | Offset: x={offset_x:.2f} y={offset_y:.2f}")
     
-                    # Calculate crop boundaries with float precision
-                    crop_x1_float = center_x - crop_w / 2.0 + offset_x
-                    crop_y1_float = center_y - crop_h / 2.0 + offset_y
-                    crop_x2_float = crop_x1_float + crop_w
-                    crop_y2_float = crop_y1_float + crop_h
-    
-                    # Clamp to frame boundaries
-                    crop_x1_float = max(0, min(w - crop_w, crop_x1_float))
-                    crop_y1_float = max(0, min(h - crop_h, crop_y1_float))
-                    crop_x2_float = crop_x1_float + crop_w
-                    crop_y2_float = crop_y1_float + crop_h
-    
-                    # Convert to int only for final crop extraction
-                    crop_x1 = int(crop_x1_float)
-                    crop_y1 = int(crop_y1_float)
-                    crop_x2 = int(crop_x2_float)
-                    crop_y2 = int(crop_y2_float)
-    
-                    # Extract crop and resize back to original size
-                    cropped = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                    stabilized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+                    # Calculate crop center with sub-pixel precision
+                    crop_center_x = center_x + offset_x
+                    crop_center_y = center_y + offset_y
+
+                    # Clamp center to valid range (keep crop fully within frame)
+                    crop_center_x = max(crop_w / 2.0, min(w - crop_w / 2.0, crop_center_x))
+                    crop_center_y = max(crop_h / 2.0, min(h - crop_h / 2.0, crop_center_y))
+
+                    # Use getRectSubPix for sub-pixel accurate extraction
+                    # This supports floating-point center coordinates for smoother stabilization
+                    cropped = cv2.getRectSubPix(frame, (crop_w, crop_h), (crop_center_x, crop_center_y))
+
+                    # Resize back to original size with high-quality interpolation
+                    stabilized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
                 else:
                     # Traditional warp-based stabilization
                     M = np.float32([[1, 0, stab_smooth_correction_x], [0, 1, stab_smooth_correction_y]])
@@ -1089,7 +1103,7 @@ class Handler(SimpleHTTPRequestHandler):
 
                             # Find the textarea and type the prompt
                             print("⌨️  Typing prompt...")
-                            prompt = "I've circled a component or components on this PCB with annotations. Please identify what component(s) are circled and provide technical details including: component type, likely part designation, function, any visible markings or identifiers, typical pinouts, test procedures, and expected voltage/resistance values.  Include description of which pins are where in the picture.  Eg.  Left/Right/Top/Bottom"
+                            prompt = "I've circled a component or components on this PCB with annotations. Please identify what component(s) are circled and provide technical details including: component type, likely part designation, function, any visible markings or identifiers, typical pinouts, test procedures, and expected voltage/resistance values.  Include description of which pins are where in the picture.  Eg.  Left/Right/Top/Bottom.  For voltage testing, if need to inject voltage to test, advise how much and where and how to inject voltage to thest the component."
 
                             # Wait for textarea to be ready and visible
                             textarea = page_instance.locator('div[contenteditable="true"]').first
@@ -1283,7 +1297,7 @@ class Handler(SimpleHTTPRequestHandler):
 
                             # Now type the prompt
                             print("⌨️  Typing prompt...")
-                            prompt = "I've circled a component or components on this PCB with annotations. Please identify what component(s) are circled and provide technical details including: component type, likely part designation, function, any visible markings or identifiers, typical pinouts, test procedures, and expected voltage/resistance values."
+                            prompt = "I've circled a component or components on this PCB with annotations. Please identify what component(s) are circled and provide technical details including: component type, likely part designation, function, any visible markings or identifiers, typical pinouts, test procedures, and expected voltage/resistance values.   Include description of which pins are where in the picture.  Eg.  Left/Right/Top/Bottom.  For voltage testing, if need to inject voltage to test, advise how much and where and how to inject voltage to thest the component."
 
                             # Find the textarea - try multiple selectors
                             textarea = None
