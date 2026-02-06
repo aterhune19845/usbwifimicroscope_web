@@ -413,6 +413,26 @@
                         Draw on the image - annotations track with camera movement
                     </p>
                 </div>
+
+                <!-- AI Component Assistant -->
+                <div class="control-group">
+                    <h4 style="margin: 0 0 10px 0; font-size: 12px; color: #999;">🤖 AI Component Assistant</h4>
+                    <div class="button-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px;">
+                        <button id="analyze-claude-btn" onclick="analyzeComponent('claude')" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                            Ask Claude
+                        </button>
+                        <button id="analyze-gemini-btn" onclick="analyzeComponent('gemini')" style="background: linear-gradient(135deg, #ea8c55 0%, #c74953 100%);">
+                            Ask Gemini
+                        </button>
+                    </div>
+                    <div id="analysis-status" style="margin-top: 8px; font-size: 10px; color: #888;">
+                        Circle a component and click to analyze
+                    </div>
+                    <p style="font-size: 9px; color: #666; margin: 8px 0 0 0;">
+                        Compare results from Claude and Gemini for better insights!
+                    </p>
+                </div>
+
             </div>
 
             <div class="control-group">
@@ -1414,6 +1434,85 @@
             }
         }
 
+        // ========== AI Component Assistant ==========
+        async function analyzeComponent(aiService) {
+            const btnId = aiService === 'gemini' ? 'analyze-gemini-btn' : 'analyze-claude-btn';
+            const btn = document.getElementById(btnId);
+            const status = document.getElementById('analysis-status');
+            const aiName = aiService === 'gemini' ? 'Gemini' : 'Claude';
+            const endpoint = aiService === 'gemini' ? '/analyze_component_gemini' : '/analyze_component';
+            const originalText = aiService === 'gemini' ? 'Ask Gemini' : 'Ask Claude';
+
+            try {
+                btn.disabled = true;
+                btn.textContent = '🌐 Opening...';
+                status.textContent = `Capturing screenshot and launching ${aiName}...`;
+                status.style.color = '#888';
+
+                // Capture screenshot with annotations as base64 PNG
+                const screenshot = captureScreenshotWithAnnotations();
+
+                // Send to backend
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        screenshot: screenshot
+                    })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Analysis failed');
+                }
+
+                const data = await response.json();
+
+                status.textContent = `✓ ${aiName} opened! Screenshot uploaded and prompt sent.`;
+                status.style.color = '#4CAF50';
+
+            } catch (err) {
+                console.error('Analysis error:', err);
+                status.textContent = 'Failed: ' + err.message;
+                status.style.color = '#ff4444';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+            }
+        }
+
+        function captureScreenshotWithAnnotations() {
+            // Create a temporary canvas to combine microscope image + annotations
+            const tempCanvas = document.createElement('canvas');
+            const tempCtx = tempCanvas.getContext('2d');
+            const img = document.getElementById('microscope-image');
+
+            // Set canvas size to match image
+            tempCanvas.width = img.naturalWidth || img.width;
+            tempCanvas.height = img.naturalHeight || img.height;
+
+            // Draw the microscope image
+            tempCtx.drawImage(img, 0, 0, tempCanvas.width, tempCanvas.height);
+
+            // Draw annotations on top if they exist
+            if (annotationCanvas && strokes.length > 0) {
+                // Scale annotations to match the full resolution
+                const scaleX = tempCanvas.width / annotationCanvas.width;
+                const scaleY = tempCanvas.height / annotationCanvas.height;
+
+                tempCtx.save();
+                tempCtx.scale(scaleX, scaleY);
+                tempCtx.drawImage(annotationCanvas, 0, 0);
+                tempCtx.restore();
+            }
+
+            // Convert to base64 PNG (without data:image/png;base64, prefix)
+            const dataURL = tempCanvas.toDataURL('image/png');
+            return dataURL.split(',')[1];
+        }
+
         // Toggle adjust mode
         function toggleAdjustMode() {
             adjustMode = !adjustMode;
@@ -1748,6 +1847,7 @@
                                 point.y = c * oldX + d * oldY + ty;
                             });
                         });
+
                         redrawAnnotations();
                     }
                 }

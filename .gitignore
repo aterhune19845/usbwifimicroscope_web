@@ -27,6 +27,10 @@ Thumbs.db
 *.webm
 *.mov
 frame_*.jpg
+api_key
+.browser_profile/
+.gemini_browser_profile/
+screenshots/
 
 # iOS (not needed for this repo)
 MicroscopeViewer-iOS/

@@ -7,6 +7,18 @@ import cv2
 import numpy as np
 import usb.core
 import usb.util
+import base64
+import os
+
+# Browser automation for Claude.ai
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+    print("✓ Playwright available for browser automation")
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    print("✗ Warning: playwright not available. Component analysis disabled.")
+    print("  Install with: pip install playwright && playwright install chromium")
 
 WEB_PORT = 1337
 current_frame = None
@@ -78,6 +90,22 @@ stab_hma_long = None
 ai_upscaler = None
 ai_model_loaded = False
 
+# Screenshot directory for browser automation
+screenshot_dir = os.path.join(os.path.dirname(__file__), 'screenshots')
+os.makedirs(screenshot_dir, exist_ok=True)
+
+# Browser automation state - keep browser alive across requests (Claude)
+playwright_instance = None
+browser_instance = None
+page_instance = None
+browser_lock = threading.Lock()
+
+# Gemini browser automation state
+gemini_playwright_instance = None
+gemini_browser_instance = None
+gemini_page_instance = None
+gemini_browser_lock = threading.Lock()
+
 # Annotation tracking state
 current_motion_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]  # Affine matrix [a, b, tx, c, d, ty]
 motion_sequence = 0  # Increments each time motion is updated
@@ -122,33 +150,44 @@ def init_ai_upscaler():
             try:
                 # Download model if it doesn't exist
                 if not os.path.exists(model_path):
-                    print(f"Downloading {model_info['name'].upper()} {model_info['scale']}x super-resolution model...")
                     urllib.request.urlretrieve(model_info['url'], model_path)
-                    print(f"Model downloaded to {model_path}")
 
                 # Initialize and load model
                 ai_upscaler = cv2.dnn_superres.DnnSuperResImpl_create()
                 ai_upscaler.readModel(model_path)
                 ai_upscaler.setModel(model_info['name'], model_info['scale'])
                 ai_model_loaded = True
-                print(f"AI super-resolution model loaded: {model_info['name'].upper()} {model_info['scale']}x (excellent quality!)")
+                print(f"✓ AI super-resolution loaded: {model_info['name'].upper()} {model_info['scale']}x")
                 model_loaded = True
                 break
-            except Exception as e:
-                print(f"Failed to load {model_info['name'].upper()}: {e}")
+            except Exception:
                 continue
 
-        if not model_loaded:
-            raise Exception("All AI upscaling models failed to load")
+        # Silently fall back to Lanczos if AI upscaler unavailable
 
-    except Exception as e:
-        print(f"Failed to load AI upscaler: {e}")
-        print("AI upscaling will not be available. Using Lanczos instead.")
+    except Exception:
+        pass  # Silently use Lanczos instead
+
+    # Set defaults if loading failed
+    if not ai_model_loaded:
         ai_upscaler = None
         ai_model_loaded = False
 
 # Initialize AI upscaler on startup
 init_ai_upscaler()
+
+def init_browser_automation():
+    """Check if browser automation is available"""
+    if PLAYWRIGHT_AVAILABLE:
+        print("✓ Browser automation ready for Claude.ai")
+    else:
+        print("✗ Browser automation not available")
+        print("  Install with: pip install playwright && playwright install chromium")
+
+# Initialize browser automation on startup
+print("\n=== Initializing Browser Automation ===")
+init_browser_automation()
+print("========================================\n")
 
 def apply_stabilization(frame, s):
     global stab_prev_gray, stab_accumulated_x, stab_accumulated_y
@@ -929,12 +968,380 @@ class Handler(SimpleHTTPRequestHandler):
                         settings['jpeg_quality'] = int(value)
                     elif setting == 'fps':
                         settings['capture_fps'] = int(value)
-            
+
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(b'{"status": "ok"}')
-        
+
+        elif self.path == '/analyze_component':
+            # Save screenshot and open Claude.ai with browser automation
+            if not PLAYWRIGHT_AVAILABLE:
+                self.send_response(503)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'error': 'Playwright not available. Install with: pip install playwright && playwright install chromium'
+                }).encode())
+                return
+
+            # Read POST body
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            data = json.loads(body)
+
+            screenshot_base64 = data.get('screenshot')  # Base64-encoded PNG
+
+            if not screenshot_base64:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'No screenshot provided'}).encode())
+                return
+
+            try:
+                # Save screenshot to file
+                import tempfile
+                timestamp = int(time.time())
+                screenshot_path = os.path.join(screenshot_dir, f'component_{timestamp}.png')
+
+                # Decode base64 and save
+                screenshot_data = base64.b64decode(screenshot_base64)
+                with open(screenshot_path, 'wb') as f:
+                    f.write(screenshot_data)
+
+                print(f"📸 Screenshot saved: {screenshot_path}")
+
+                # Launch browser automation in a separate thread to not block
+                def automate_claude():
+                    global playwright_instance, browser_instance, page_instance
+
+                    try:
+                        with browser_lock:
+                            # Check if browser context is still alive
+                            reuse_browser = False
+                            if browser_instance is not None:
+                                try:
+                                    # Check if context is still alive
+                                    existing_pages = browser_instance.pages
+                                    if existing_pages:
+                                        # Reuse existing page or create new one
+                                        page_instance = existing_pages[0]
+                                        print("♻️  Reusing existing browser, navigating to new chat...")
+                                        page_instance.goto('https://claude.ai/new', wait_until='domcontentloaded')
+                                        time.sleep(2)
+                                        reuse_browser = True
+                                except:
+                                    # Browser died or not responding, force cleanup
+                                    print("🔄 Browser not responding, forcing cleanup...")
+                                    try:
+                                        if browser_instance:
+                                            browser_instance.close()
+                                        if playwright_instance:
+                                            playwright_instance.stop()
+                                    except:
+                                        pass
+
+                                    # Force kill any chromium processes using our profile
+                                    try:
+                                        import subprocess
+                                        subprocess.run(['pkill', '-f', 'chromium.*browser_profile'],
+                                                     stdout=subprocess.DEVNULL,
+                                                     stderr=subprocess.DEVNULL)
+                                        time.sleep(1)  # Wait for process to die
+                                    except:
+                                        pass
+
+                                    playwright_instance = None
+                                    browser_instance = None
+                                    page_instance = None
+
+                            if not reuse_browser:
+                                # Start new browser with persistent profile to avoid CAPTCHA
+                                playwright_instance = sync_playwright().start()
+
+                                # Use persistent context to save cookies/login
+                                user_data_dir = os.path.join(os.path.dirname(__file__), '.browser_profile')
+
+                                browser_instance = playwright_instance.chromium.launch_persistent_context(
+                                    user_data_dir=user_data_dir,
+                                    headless=False,
+                                    args=['--disable-blink-features=AutomationControlled']  # Hide automation
+                                )
+                                page_instance = browser_instance.pages[0] if browser_instance.pages else browser_instance.new_page()
+
+                                # Navigate to Claude.ai
+                                print("🌐 Opening Claude.ai...")
+                                page_instance.goto('https://claude.ai/new', wait_until='domcontentloaded')
+
+                                # Give time for CAPTCHA/login if needed
+                                print("⏳ Waiting 3 seconds for page to load...")
+                                print("   (Browser will stay open - solve any challenge if needed)")
+                                time.sleep(3)
+
+                            # Upload screenshot to the (possibly existing) conversation
+                            print("📎 Uploading screenshot...")
+                            file_input = page_instance.locator('input[type="file"]').first
+                            file_input.set_input_files(screenshot_path, timeout=10000)
+
+                            # Wait for upload to process
+                            time.sleep(2)
+
+                            # Find the textarea and type the prompt
+                            print("⌨️  Typing prompt...")
+                            prompt = "I've circled a component or components on this PCB with annotations. Please identify what component(s) are circled and provide technical details including: component type, likely part designation, function, any visible markings or identifiers, typical pinouts, test procedures, and expected voltage/resistance values."
+
+                            # Wait for textarea to be ready and visible
+                            textarea = page_instance.locator('div[contenteditable="true"]').first
+                            textarea.wait_for(state='visible', timeout=10000)
+                            textarea.click()
+                            time.sleep(0.5)
+                            textarea.fill(prompt)
+
+                            # Wait a moment for the message to be ready
+                            time.sleep(1)
+
+                            # Press Enter or click send button
+                            print("🚀 Sending message...")
+                            textarea.press('Enter')
+
+                            if reuse_browser:
+                                print("✓ New screenshot sent to existing conversation!")
+                            else:
+                                print("✓ Message sent! Browser window will stay open for additional screenshots.")
+
+                    except Exception as e:
+                        print(f"✗ Browser automation error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Reset on error
+                        with browser_lock:
+                            playwright_instance = None
+                            browser_instance = None
+                            page_instance = None
+
+                # Start automation in background thread
+                automation_thread = threading.Thread(target=automate_claude, daemon=True)
+                automation_thread.start()
+
+                # Return success immediately
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'success',
+                    'message': 'Opening Claude.ai in browser...',
+                    'screenshot': screenshot_path
+                }).encode())
+
+            except Exception as e:
+                print(f"✗ Error: {e}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': str(e)}).encode())
+
+        elif self.path == '/analyze_component_gemini':
+            # Save screenshot and open Google Gemini with browser automation
+            if not PLAYWRIGHT_AVAILABLE:
+                self.send_response(503)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'error': 'Playwright not available'
+                }).encode())
+                return
+
+            # Read POST body
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            data = json.loads(body)
+            screenshot_base64 = data.get('screenshot')
+
+            if not screenshot_base64:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'No screenshot provided'}).encode())
+                return
+
+            try:
+                # Save screenshot to file
+                timestamp = int(time.time())
+                screenshot_path = os.path.join(screenshot_dir, f'component_{timestamp}.png')
+                screenshot_data = base64.b64decode(screenshot_base64)
+                with open(screenshot_path, 'wb') as f:
+                    f.write(screenshot_data)
+                print(f"📸 Screenshot saved: {screenshot_path}")
+
+                # Launch browser automation in a separate thread
+                def automate_gemini():
+                    global gemini_playwright_instance, gemini_browser_instance, gemini_page_instance
+
+                    try:
+                        with gemini_browser_lock:
+                            # Check if browser context is still alive
+                            reuse_browser = False
+                            if gemini_browser_instance is not None:
+                                try:
+                                    existing_pages = gemini_browser_instance.pages
+                                    if existing_pages:
+                                        gemini_page_instance = existing_pages[0]
+                                        print("♻️  Reusing existing Gemini browser...")
+                                        gemini_page_instance.goto('https://aistudio.google.com/prompts/new_chat', wait_until='domcontentloaded')
+                                        time.sleep(2)
+                                        reuse_browser = True
+                                except:
+                                    print("🔄 Gemini browser not responding, forcing cleanup...")
+                                    try:
+                                        if gemini_browser_instance:
+                                            gemini_browser_instance.close()
+                                        if gemini_playwright_instance:
+                                            gemini_playwright_instance.stop()
+                                    except:
+                                        pass
+
+                                    # Force kill any chromium processes using gemini profile
+                                    try:
+                                        import subprocess
+                                        subprocess.run(['pkill', '-f', 'chromium.*gemini_browser_profile'],
+                                                     stdout=subprocess.DEVNULL,
+                                                     stderr=subprocess.DEVNULL)
+                                        time.sleep(1)
+                                    except:
+                                        pass
+
+                                    gemini_playwright_instance = None
+                                    gemini_browser_instance = None
+                                    gemini_page_instance = None
+
+                            if not reuse_browser:
+                                # Start new browser with persistent profile
+                                gemini_playwright_instance = sync_playwright().start()
+                                user_data_dir = os.path.join(os.path.dirname(__file__), '.gemini_browser_profile')
+                                gemini_browser_instance = gemini_playwright_instance.chromium.launch_persistent_context(
+                                    user_data_dir=user_data_dir,
+                                    headless=False,
+                                    args=['--disable-blink-features=AutomationControlled']
+                                )
+                                gemini_page_instance = gemini_browser_instance.pages[0] if gemini_browser_instance.pages else gemini_browser_instance.new_page()
+
+                                print("🌐 Opening Gemini AI Studio...")
+                                gemini_page_instance.goto('https://aistudio.google.com/prompts/new_chat', wait_until='domcontentloaded')
+                                print("⏳ Waiting 3 seconds for page to load...")
+                                time.sleep(3)
+
+                            # Upload screenshot using clipboard paste
+                            print("📎 Uploading screenshot to Gemini via clipboard...")
+                            upload_success = False
+
+                            try:
+                                # Step 1: Copy image to clipboard (macOS)
+                                print("   Copying image to clipboard...")
+                                import subprocess
+                                # Use osascript to copy PNG to clipboard
+                                subprocess.run([
+                                    'osascript', '-e',
+                                    f'set the clipboard to (read (POSIX file "{screenshot_path}") as «class PNGf»)'
+                                ], check=True, capture_output=True)
+                                print("   ✓ Image copied to clipboard")
+
+                                # Step 2: Find and click textarea
+                                print("   Finding prompt textarea...")
+                                textarea_selectors = ['textarea', 'div[contenteditable="true"]', '[role="textbox"]']
+                                prompt_element = None
+
+                                for selector in textarea_selectors:
+                                    try:
+                                        prompt_element = gemini_page_instance.locator(selector).first
+                                        prompt_element.wait_for(state='visible', timeout=3000)
+                                        prompt_element.click()
+                                        print(f"   Clicked prompt element: {selector}")
+                                        time.sleep(0.5)
+                                        break
+                                    except Exception:
+                                        continue
+
+                                if prompt_element:
+                                    # Step 3: Paste the image (Cmd+V on macOS)
+                                    print("   Pasting image into prompt...")
+                                    prompt_element.press('Meta+V')  # Meta = Cmd on macOS
+                                    time.sleep(2)  # Wait for upload to process
+                                    print("   ✓ Image pasted!")
+                                    upload_success = True
+                                else:
+                                    print("   ⚠️  Could not find prompt textarea")
+
+                            except Exception as upload_error:
+                                print(f"⚠️  Clipboard upload error: {upload_error}")
+                                import traceback
+                                traceback.print_exc()
+
+                            if not upload_success:
+                                print("⚠️  Could not auto-upload screenshot")
+                                print(f"   Please drag manually: {screenshot_path}")
+
+                            # Now type the prompt
+                            print("⌨️  Typing prompt...")
+                            prompt = "I've circled a component or components on this PCB with annotations. Please identify what component(s) are circled and provide technical details including: component type, likely part designation, function, any visible markings or identifiers, typical pinouts, test procedures, and expected voltage/resistance values."
+
+                            # Find the textarea - try multiple selectors
+                            textarea = None
+                            selectors = ['div[contenteditable="true"]', 'textarea', '[role="textbox"]']
+                            for selector in selectors:
+                                try:
+                                    textarea = gemini_page_instance.locator(selector).first
+                                    textarea.wait_for(state='visible', timeout=5000)
+                                    break
+                                except Exception:
+                                    continue
+
+                            if textarea:
+                                textarea.click()
+                                time.sleep(0.5)
+                                textarea.fill(prompt)
+                                time.sleep(1)
+
+                            # Send message by clicking Run button
+                            print("🚀 Clicking Run button to send message...")
+                            try:
+                                run_button = gemini_page_instance.locator('button[type="submit"]:has-text("Run")').first
+                                run_button.click(timeout=5000)
+                                print("✓ Message sent to Gemini!")
+                            except Exception as e:
+                                print(f"⚠️  Could not click Run button: {e}")
+                                print("   Please click Run manually")
+
+                    except Exception as e:
+                        print(f"✗ Gemini browser automation error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        with gemini_browser_lock:
+                            gemini_playwright_instance = None
+                            gemini_browser_instance = None
+                            gemini_page_instance = None
+
+                # Start automation in background thread
+                automation_thread = threading.Thread(target=automate_gemini, daemon=True)
+                automation_thread.start()
+
+                # Return success immediately
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'success',
+                    'message': 'Opening Gemini in browser...',
+                    'screenshot': screenshot_path
+                }).encode())
+
+            except Exception as e:
+                print(f"✗ Error: {e}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': str(e)}).encode())
+
         else:
             self.send_response(404)
             self.end_headers()
