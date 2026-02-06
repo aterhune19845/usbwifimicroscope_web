@@ -1089,7 +1089,7 @@ class Handler(SimpleHTTPRequestHandler):
 
                             # Find the textarea and type the prompt
                             print("⌨️  Typing prompt...")
-                            prompt = "I've circled a component or components on this PCB with annotations. Please identify what component(s) are circled and provide technical details including: component type, likely part designation, function, any visible markings or identifiers, typical pinouts, test procedures, and expected voltage/resistance values."
+                            prompt = "I've circled a component or components on this PCB with annotations. Please identify what component(s) are circled and provide technical details including: component type, likely part designation, function, any visible markings or identifiers, typical pinouts, test procedures, and expected voltage/resistance values.  Include description of which pins are where in the picture.  Eg.  Left/Right/Top/Bottom"
 
                             # Wait for textarea to be ready and visible
                             textarea = page_instance.locator('div[contenteditable="true"]').first
