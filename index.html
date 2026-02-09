@@ -494,6 +494,25 @@
                     ⏺ Recording: <span id="recording-time">0:00</span>
                 </div>
             </div>
+
+            <div class="control-group" style="margin-top: 20px; padding: 15px; background: #1a1a1a; border-radius: 8px;">
+                <h3 style="margin-bottom: 10px; font-size: 14px; color: #999;">Keyboard Shortcuts</h3>
+                <div style="font-size: 11px; color: #666; line-height: 1.6;">
+                    <div style="display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;">
+                        <strong style="color: #888;">R</strong> <span>Toggle Raw Mode (no processing)</span>
+                        <strong style="color: #888;">S</strong> <span>Toggle Stabilization</span>
+                        <strong style="color: #888;">P</strong> <span>Take Screenshot</span>
+                        <strong style="color: #888;">H</strong> <span>Flip Horizontal</span>
+                        <strong style="color: #888;">V</strong> <span>Flip Vertical</span>
+                        <strong style="color: #888;">D</strong> <span>Toggle Drawing Mode</span>
+                        <strong style="color: #888;">A</strong> <span>Toggle Adjust Mode</span>
+                        <strong style="color: #888;">C</strong> <span>Clear Annotations</span>
+                        <strong style="color: #888;">+/=</strong> <span>Zoom In</span>
+                        <strong style="color: #888;">-</strong> <span>Zoom Out</span>
+                        <strong style="color: #888;">Ctrl+R</strong> <span>Start/Stop Recording</span>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <div class="main-content">
@@ -893,7 +912,125 @@
                 .catch(err => console.error('Failed to set gain:', err));
         });
 
-        // Reset all settings
+        // Raw mode toggle - save/restore all settings
+        let rawModeActive = false;
+        let savedSettings = null;
+
+        function toggleRawMode() {
+            if (!rawModeActive) {
+                // Entering raw mode - save current settings
+                savedSettings = {
+                    brightness: parseInt(brightnessSlider.value),
+                    contrast: parseInt(contrastSlider.value),
+                    saturation: parseInt(saturationSlider.value),
+                    gain: parseInt(gainSlider.value),
+                    zoom: parseInt(zoomSlider.value),
+                    stabilize: stabilizeEnabled,
+                    lanczos: lanczosEnabled,
+                    clahe: claheEnabled,
+                    sharpen: sharpenEnabled,
+                    aiUpscale: aiUpscaleEnabled
+                };
+
+                // Set everything to raw (no processing)
+                brightnessSlider.value = 0;
+                brightnessValue.textContent = '0';
+                contrastSlider.value = 100;
+                contrastValue.textContent = '1.0';
+                saturationSlider.value = 100;
+                saturationValue.textContent = '1.0';
+                gainSlider.value = 100;
+                gainValue.textContent = '1.0';
+                zoomSlider.value = 100;
+                zoomValue.textContent = '100%';
+
+                // Send requests to disable all processing
+                fetch('/process/brightness/0', { method: 'POST' });
+                fetch('/process/contrast/100', { method: 'POST' });
+                fetch('/process/saturation/100', { method: 'POST' });
+                fetch('/process/gain/100', { method: 'POST' });
+                fetch('/process/zoom/100', { method: 'POST' });
+
+                // Turn off stabilization if it was on
+                if (savedSettings.stabilize) {
+                    toggleStabilize();
+                }
+
+                // Turn off Lanczos if it was on
+                if (savedSettings.lanczos) {
+                    toggleLanczos();
+                }
+
+                // Turn off CLAHE if it was on
+                if (savedSettings.clahe) {
+                    toggleCLAHE();
+                }
+
+                // Turn off sharpen if it was on
+                if (savedSettings.sharpen) {
+                    toggleSharpen();
+                }
+
+                // Turn off AI upscale if it was on
+                if (savedSettings.aiUpscale) {
+                    toggleAIUpscale();
+                }
+
+                rawModeActive = true;
+                console.log('Raw mode: ON');
+            } else {
+                // Exiting raw mode - restore previous settings
+                if (savedSettings) {
+                    brightnessSlider.value = savedSettings.brightness;
+                    brightnessValue.textContent = savedSettings.brightness;
+                    contrastSlider.value = savedSettings.contrast;
+                    contrastValue.textContent = (savedSettings.contrast / 100).toFixed(1);
+                    saturationSlider.value = savedSettings.saturation;
+                    saturationValue.textContent = (savedSettings.saturation / 100).toFixed(1);
+                    gainSlider.value = savedSettings.gain;
+                    gainValue.textContent = (savedSettings.gain / 100).toFixed(1);
+                    zoomSlider.value = savedSettings.zoom;
+                    zoomValue.textContent = savedSettings.zoom + '%';
+
+                    // Send requests to restore all processing
+                    fetch(`/process/brightness/${savedSettings.brightness}`, { method: 'POST' });
+                    fetch(`/process/contrast/${savedSettings.contrast}`, { method: 'POST' });
+                    fetch(`/process/saturation/${savedSettings.saturation}`, { method: 'POST' });
+                    fetch(`/process/gain/${savedSettings.gain}`, { method: 'POST' });
+                    fetch(`/process/zoom/${savedSettings.zoom}`, { method: 'POST' });
+
+                    // Restore stabilization if it was on
+                    if (savedSettings.stabilize && !stabilizeEnabled) {
+                        toggleStabilize();
+                    }
+
+                    // Restore Lanczos if it was on
+                    if (savedSettings.lanczos && !lanczosEnabled) {
+                        toggleLanczos();
+                    }
+
+                    // Restore CLAHE if it was on
+                    if (savedSettings.clahe && !claheEnabled) {
+                        toggleCLAHE();
+                    }
+
+                    // Restore sharpen if it was on
+                    if (savedSettings.sharpen && !sharpenEnabled) {
+                        toggleSharpen();
+                    }
+
+                    // Restore AI upscale if it was on
+                    if (savedSettings.aiUpscale && !aiUpscaleEnabled) {
+                        toggleAIUpscale();
+                    }
+                }
+
+                rawModeActive = false;
+                console.log('Raw mode: OFF (settings restored)');
+            }
+        }
+
+        // Reset all settings (kept for compatibility, but not bound to 'r' key anymore)
         function resetAll() {
             // Reset sliders to defaults
             brightnessSlider.value = 0;
@@ -1077,9 +1214,9 @@
                 takeScreenshot();  // P for Picture
             } else if (e.key === 'r' || e.key === 'R') {
                 if (e.ctrlKey || e.metaKey) {
-                    toggleRecording();
+                    toggleRecording();  // Ctrl/Cmd+R for Recording
                 } else {
-                    resetAll();
+                    toggleRawMode();  // R for Raw mode toggle
                 }
             } else if (e.key === 'h' || e.key === 'H') {
                 flipHorizontal();
@@ -1100,6 +1237,7 @@
                     // Update stabilization button and panel
                     const stabilizeBtn = document.getElementById('stabilize-btn');
                     const stabilizeSettings = document.getElementById('stabilize-settings');
+                    stabilizeEnabled = settings.stabilize;  // Sync the variable!
                     stabilizeBtn.textContent = 'Stabilize: ' + (settings.stabilize ? 'ON' : 'OFF');
                     stabilizeSettings.style.display = settings.stabilize ? 'block' : 'none';
 
